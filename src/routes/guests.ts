@@ -1,4 +1,4 @@
-import type { FastifyPluginAsync, FastifyRequest } from 'fastify';
+import type { FastifyBaseLogger, FastifyPluginAsync, FastifyRequest } from 'fastify';
 import { randomUUID } from 'crypto';
 import { z } from 'zod';
 import {
@@ -22,9 +22,10 @@ import { getGuestSigningKey } from '../lib/guest-signing-key.js';
 import { broadcast } from '../services/tally.service.js';
 import { resolvePublicBaseUrl, updateProductionDoc } from './productions.js';
 import { applyReturnMode } from '../ws/controller.js';
-import { resolveStromWhipUrl } from './whip.js';
 import { getStromToken } from '../lib/strom-token.js';
+import { assertSameStromOrigin } from '../lib/url-validation.js';
 import { slotTakesWhip } from '../lib/guest-scope.js';
+import { applyGuestSlotMixerLabel, guestSlotDefaultLabel } from '../lib/guest-slot-label.js';
 import {
   isIntercomEnabled,
   provisionGuestLine,
@@ -116,9 +117,10 @@ function inviteToApi(doc: GuestInviteDoc) {
 }
 
 function sessionToApi(doc: GuestSessionDoc) {
-  const { _id, _rev, type, ...rest } = doc;
+  const { _id, _rev, type, whipSessionUrl, ...rest } = doc;
   void _rev;
   void type;
+  void whipSessionUrl; // internal Strom session-resource URL — never echo to clients
   // `muted` is always projected (default false) so the operator's guest list
   // reflects mute state even for a guest who has not toggled it yet (issue #382).
   return { id: _id, ...rest, muted: !!doc.muted };
@@ -188,27 +190,85 @@ function guestSlotAssignment(
 }
 
 /**
- * Free a guest slot on the server (issue #381 item 4): tear down the slot's WHIP
- * publisher in Strom from the backend, rather than leaving teardown to the
+ * Free a guest slot on the server (issue #381 item 4): tear down the guest's
+ * WHIP publisher in Strom from the backend, rather than leaving teardown to the
  * guest's browser, so a crashed or lingering browser cannot keep the slot busy
- * for the next guest. Reuses the existing WHIP endpoint contract
- * (`resolveStromWhipUrl`) and the shared Strom token. No-op when the production
- * has no live flow — there is nothing to tear down. Best-effort: teardown
- * failures are swallowed (a stale session in Strom must not block the kick/leave
- * that frees the slot in our own state).
+ * for the next guest.
+ *
+ * Strom only routes `DELETE` on the WHIP **session resource**
+ * (`/whip/{endpoint_id}/resource/{resource_id}`), NOT on the bare endpoint — a
+ * DELETE on the endpoint does nothing, so Strom kept the guest session until its
+ * 10 s inactivity reaper (issue #467). We therefore DELETE the exact
+ * session-resource URL Strom minted at publish time, captured from the WHIP POST
+ * `Location` and persisted on the session as `whipSessionUrl`.
+ *
+ * No-op when the session never published a WHIP resource (return-only slot, or
+ * the guest left before publishing) — there is nothing to tear down. Best-effort:
+ * a failure must not block the kick/leave that frees the slot in our own state,
+ * but — unlike before — the outcome is now LOGGED (non-2xx or network error) so a
+ * lingering Strom session is diagnosable rather than silently swallowed.
  */
 async function teardownGuestWhip(
-  production: ProductionDoc,
-  mixerInput: string,
+  session: GuestSessionDoc,
+  log: FastifyBaseLogger,
 ): Promise<void> {
-  if (production.status !== 'active' || !production.stromFlowId) return;
-  const target = resolveStromWhipUrl(production._id, mixerInput);
+  const target = session.whipSessionUrl;
+  if (!target) return;
+  // Defence in depth: only ever DELETE a URL on the configured Strom host, so a
+  // malformed/forged stored Location can never drive an SSRF or leak the Strom
+  // bearer token off-host (mirrors `assertSameStromOrigin` on the WHIP proxy).
+  try {
+    assertSameStromOrigin(target, config.stromUrl, 'WHIP session URL');
+  } catch (err) {
+    log.warn({ err, target }, 'guest WHIP teardown — stored session URL is not on the Strom host; skipping');
+    return;
+  }
   const token = await getStromToken(config.stromToken).catch(() => undefined);
   const headers: Record<string, string> = {};
   if (token) headers['Authorization'] = `Bearer ${token}`;
-  await fetch(target, { method: 'DELETE', headers }).catch(() => {
-    /* ignore teardown errors — the slot is freed in our own session state regardless */
-  });
+  try {
+    const res = await fetch(target, { method: 'DELETE', headers });
+    if (!res.ok) {
+      log.warn(
+        { status: res.status, target },
+        'guest WHIP teardown — Strom returned non-2xx; session may linger until the inactivity reaper',
+      );
+    }
+  } catch (err) {
+    log.warn(
+      { err, target },
+      'guest WHIP teardown — DELETE to Strom failed; session may linger until the inactivity reaper',
+    );
+  }
+}
+
+/**
+ * Reset a guest slot's multiview tile back to its `Guest N` label (issue #466)
+ * — used when a guest leaves, is kicked, or their invite is revoked. Loads the
+ * production fresh (the live flow/mixer ids and the `mixerInputMap` live there)
+ * and pushes the label to Strom best-effort. Never throws: a failure must not
+ * block the leave/kick/revoke that frees the slot (same contract as
+ * `teardownGuestWhip`). No-op when the production is gone or the slot is not a
+ * declared guest slot.
+ */
+async function resetGuestSlotLabel(
+  productionId: string,
+  mixerInput: string | undefined,
+  log: FastifyBaseLogger,
+): Promise<void> {
+  if (!mixerInput) return;
+  let production: ProductionDoc;
+  try {
+    production = await getDb().get(productionId);
+  } catch {
+    return;
+  }
+  await applyGuestSlotMixerLabel(
+    production,
+    mixerInput,
+    guestSlotDefaultLabel(production, mixerInput),
+    log,
+  );
 }
 
 const guestsRoutes: FastifyPluginAsync = async (fastify) => {
@@ -344,6 +404,10 @@ const guestsRoutes: FastifyPluginAsync = async (fastify) => {
         fastify.log.warn({ err }, 'DELETE guests/invites — DB delete failed');
         return reply.status(503).send({ error: 'Database unavailable', statusCode: 503 });
       }
+      // Reset the slot's multiview tile back to `Guest N` (issue #466): a revoked
+      // invite's guest should no longer be named on air. Best-effort — the invite
+      // is already revoked and the DELETE must not fail over a cosmetic label.
+      await resetGuestSlotLabel(doc.productionId, doc.mixerInput, fastify.log);
       return reply.status(204).send();
     },
   );
@@ -589,6 +653,19 @@ const guestsRoutes: FastifyPluginAsync = async (fastify) => {
       //     the final persisted session (state `joined`, intercom ref if any).
       broadcastGuestState(session, invite.label);
 
+      // 5d. Show the guest's invite name on their multiview tile while the show
+      //     runs (issue #466). `input_{N}_label` became a live property in Strom
+      //     PR#1014, so when the flow is live we PATCH the invite label onto the
+      //     slot's tile (falling back to `Guest N` when the invite has no label).
+      //     Best-effort: on an older Strom the property is rejected and the tile
+      //     keeps `Guest N` — the join has already succeeded and must not fail.
+      await applyGuestSlotMixerLabel(
+        production,
+        mixerInput,
+        invite.label ?? guestSlotDefaultLabel(production, mixerInput),
+        fastify.log,
+      );
+
       // 6. Build the response. whipUrl and the return-picture feed URL point at
       //    the guest-scoped aliases under `/api/v1/guests/:inviteId/...` (issue
       //    #423) rather than the crew `/api/v1/productions/...` paths: on OSC the
@@ -664,15 +741,15 @@ const guestsRoutes: FastifyPluginAsync = async (fastify) => {
           };
           await getGuestSessionsDb().insert(leftSession);
           broadcastGuestState(leftSession, invite.label);
-          // Free the slot server-side (#381 item 4): tear down the guest's WHIP
-          // publisher in Strom from the backend so the next guest can take the
-          // slot even if this guest's browser lingers or crashed.
-          try {
-            const production = await getDb().get(invite.productionId);
-            await teardownGuestWhip(production, leftSession.mixerInput);
-          } catch (err) {
-            fastify.log.warn({ err }, 'DELETE guests/:id/session — WHIP teardown skipped');
-          }
+          // Free the slot server-side (#381 item 4): end the guest's Strom WHIP
+          // session so the next guest can take the slot even if this guest's
+          // browser lingers or crashed (issue #467 — DELETE the session resource,
+          // not the endpoint). teardownGuestWhip never throws, so it needs no
+          // guard of its own.
+          await teardownGuestWhip(leftSession, fastify.log);
+          // Reset the multiview tile back to `Guest N` now the guest is gone
+          // (issue #466). Best-effort — never fails the leave.
+          await resetGuestSlotLabel(leftSession.productionId, leftSession.mixerInput, fastify.log);
         }
       } catch (err) {
         fastify.log.warn({ err }, 'DELETE guests/:id/session — DB write failed');
@@ -795,13 +872,14 @@ const guestsRoutes: FastifyPluginAsync = async (fastify) => {
         return reply.status(503).send({ error: 'Database unavailable', statusCode: 503 });
       }
 
-      // Free the slot on the server so the next guest can join (#381 item 4).
-      try {
-        const production = await getDb().get(session.productionId);
-        await teardownGuestWhip(production, session.mixerInput);
-      } catch (err) {
-        fastify.log.warn({ err }, 'DELETE guests/:guestId — WHIP teardown skipped');
-      }
+      // Free the slot on the server so the next guest can join (#381 item 4):
+      // end the guest's Strom WHIP session resource, not the endpoint (issue
+      // #467). teardownGuestWhip never throws. `session` carries the stored
+      // whipSessionUrl (leftSession is just the same doc marked `left`).
+      await teardownGuestWhip(session, fastify.log);
+      // Reset the multiview tile back to `Guest N` now the guest is gone (issue
+      // #466). Best-effort — never fails the kick.
+      await resetGuestSlotLabel(session.productionId, session.mixerInput, fastify.log);
 
       return reply.status(204).send();
     },
