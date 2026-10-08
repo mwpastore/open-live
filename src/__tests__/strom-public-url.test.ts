@@ -97,6 +97,7 @@ async function activate(): Promise<Record<string, unknown>> {
     mixerBlockId: 'mixer-1',
     whepOutputEntries: [{ outputId: 'out-1', endpointId: 'out-ep' }],
     pgmWhepEndpointId: 'pgm-ep',
+    warnings: [],
     sourceOffsetBlockIds: {},
     sourceAudioOffsetBlockIds: {},
     clipPlayerBlockIds: {},
