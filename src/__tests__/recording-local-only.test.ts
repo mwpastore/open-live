@@ -65,7 +65,7 @@ vi.mock('../lib/strom-token.js', () => ({
 const mockUploadRecordings = vi.fn();
 vi.mock('../lib/recording-uploader.js', async (importOriginal) => {
   const actual = await importOriginal<typeof import('../lib/recording-uploader.js')>();
-  return { ...actual, uploadRecordings: (...args: unknown[]) => mockUploadRecordings(...args) };
+  return { ...actual, uploadProductionRecordings: (...args: unknown[]) => mockUploadRecordings(...args) };
 });
 
 import { buildServer } from '../server.js';
@@ -195,10 +195,10 @@ describe('POST /api/v1/productions/:id/deactivate — recorder teardown', () => 
     const res = await app.inject({ method: 'POST', url: '/api/v1/productions/prod-rec-1/deactivate' });
 
     expect(res.statusCode).toBe(200);
-    expect(mockSplitNow).toHaveBeenCalledWith('flow-rec', 'recorder-1');
+    expect(mockSplitNow).not.toHaveBeenCalled();
     expect(mockUploadRecordings).toHaveBeenCalledOnce();
-    const uploadArgs = mockUploadRecordings.mock.calls[0][0] as { outputDir: string; target: { bucket: string } };
-    expect(uploadArgs.outputDir).toBe('recordings/prod-rec-1');
+    const uploadArgs = mockUploadRecordings.mock.calls[0][0] as { productionId: string; target: { bucket: string } };
+    expect(uploadArgs.productionId).toBe('prod-rec-1');
     expect(uploadArgs.target.bucket).toBe('openlive-vod');
     expect(mockRecordingInsert).toHaveBeenCalledOnce();
     expect(mockRecordingInsert.mock.calls[0][0]).toMatchObject({

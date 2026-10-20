@@ -105,6 +105,7 @@ async function activate(): Promise<Record<string, unknown>> {
     fastWhepEntries: [],
     mixerInputMap: {},
     warnings: [],
+    inputRecorders: [],
   });
 
   const app = await buildServer();
