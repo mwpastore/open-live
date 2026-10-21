@@ -540,7 +540,7 @@ const GUEST_PAGE_HTML = `<!DOCTYPE html>
     function usableIceServer(server) {
       var urls = [].concat(server.urls || []);
       return urls.length > 0 && urls.every(function (u) {
-        return !/^turns?:/.test(u) || (server.username && server.credential);
+        return !/^turns?:/i.test(u) || (server.username && server.credential);
       });
     }
 
@@ -558,7 +558,7 @@ const GUEST_PAGE_HTML = `<!DOCTYPE html>
     // True when the ICE servers include a TURN server.
     function hasTurn() {
       return ICE.iceServers.some(function (s) {
-        return [].concat(s.urls).some(function (u) { return /^turns?:/.test(u); });
+        return [].concat(s.urls).some(function (u) { return /^turns?:/i.test(u); });
       });
     }
 
