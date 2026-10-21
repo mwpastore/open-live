@@ -1,5 +1,7 @@
 import { randomUUID } from 'crypto';
-import type { ProductionDoc, SourceDoc, GraphicDoc, OutputDoc, ClipReference } from '../db/types.js';
+import type {
+  ProductionDoc, SourceDoc, GraphicDoc, OutputDoc, ClipReference, ActivationWarning, AudioStreamNotAppliedReason, StreamType,
+} from '../db/types.js';
 import { getSourcesDb, getGraphicsDb } from '../db/index.js';
 import { deserializeClipReference } from './clip-reference.js';
 import { StromClient } from './strom.js';
@@ -10,9 +12,12 @@ import { composeRtmpUrl } from './rtmp.js';
 import { safeFlowProjection } from './log-redact.js';
 import { VIRTUAL_SOURCES, assignAudioChannels } from './audio-channels.js';
 import { assignReturnBuses, returnSendMatrix } from './return-feeds.js';
-import { activationRecordingsDirName, productionRecordingsDir } from './recording-uploader.js';
+import { buildStromPropsFromStore } from './audio-processing.js';
+import { withGuestSlotStudioInputSuffix } from './mixer-input-map.js';
+import { addTranscodingInputRecorder, type InputRecorder, type InputRecordMode, type InputTap } from './input-recording.js';
 import { assignPortsToFlow, unassignPortsFromFlow } from '../services/port-reservation.js';
 import { listenerPortRequest } from '../services/listener-ports.js';
+import { activationRecordingsDirName, productionRecordingsDir } from './recording-uploader.js';
 import {
   conversationFlowDescription,
   conversationFlowOwner,
@@ -39,11 +44,13 @@ export interface ActivationResult {
   whepOutputEntries?: Array<{ outputId: string; endpointId: string }>;
   pgmWhepEndpointId?: string;
   /**
-   * ID of the builtin.recorder block wired into the flow — set only when a
+   * ID of the builtin.liverecorder block wired into the flow — set only when a
    * 'recording' output is assigned. The block records local segments in Strom;
    * open-live uploads them to MinIO after deactivate (see recording-uploader.ts).
    */
   recorderBlockId?: string;
+  /** ID of the 'recording' OutputDoc the recorder block was built for (issue #534). */
+  recorderOutputId?: string;
   /**
    * Relative media directory the recorder writes into (output_dir property). Used
    * post-deactivate to locate the recorded segments via Strom's media API.
@@ -54,6 +61,14 @@ export interface ActivationResult {
    * operator needs to know about (e.g. a recording with no sound).
    */
   warnings: ActivationWarning[];
+  /**
+   * Strom media directory of this activation's recordings — the program
+   * recorder writes into it and each input recorder into a subdirectory. Set
+   * when any recorder is wired.
+   */
+  recordingsDir?: string;
+  /** One per recorded input (`ProductionSourceAssignment.record`), in mixerInput order. */
+  inputRecorders: ActivationInputRecorder[];
   /** WHEP endpoint ID for the mixer's monitor_out (headphone/monitor bus) — undefined if no audio mixer */
   monitorWhepEndpointId?: string;
   /** Maps mixerInput (e.g. 'video_in_1') → time_offset block ID — so the WS layer can apply live offset changes */
@@ -72,6 +87,20 @@ export interface ActivationResult {
   /** WHEP endpoint IDs for per-guest return outputs, keyed by the guest's mixerInput. */
   returnWhepEntries: Array<{ mixerInput: string; endpointId: string }>;
   /**
+   * Maps a stored `mixerInput` (e.g. 'video_in_15') to the COMPACT vision-mixer
+   * pad index actually wired in the live Strom flow (issue #463). Studio allocates
+   * guest slots from the top of the mixer-input range down (video_in_15,
+   * video_in_14, …), so sizing the mixer by the highest stored pad produced a
+   * 16-input mixer full of empty tiles. The flow is instead sized to what the
+   * production uses and the sparse stored pads are compacted to 0..N-1, while the
+   * stored `mixerInput` stays the stable external identity (invites, return feeds,
+   * the controller all key off it). The WS layer applies this map at the Strom
+   * boundary (switch/PiP/effect) and inverts it for Strom state read-backs, so the
+   * open-live↔Studio API contract is unchanged. Identity for contiguous-from-0
+   * productions. Returned so the activation route can persist it on the doc.
+   */
+  mixerInputMap: Record<string, number>;
+  /**
    * Audio-only fast return endpoints (`returnFeed.lowLatency`), keyed by the
    * guest's mixerInput. Empty when no guest asked for one or the conversation
    * flow could not start.
@@ -81,20 +110,79 @@ export interface ActivationResult {
   fastFeedRouter?: FastFeedRouter;
 }
 
-export type ActivationWarning = { type: 'recording-no-audio'; message: string };
+export type { ActivationWarning, AudioStreamNotAppliedReason };
 
 /**
- * Whether Strom has the builtin.audioenc block (added in Strom 0.6.9). If the
- * block list can't be read, assume it does: the flow create/start that follows
- * reports an unreachable Strom better than a guess here would.
+ * Highest `audioStreamIndex` that could ever be applied (spec §6 Q7): more than
+ * 8 audio streams is beyond any realistic contribution feed, and building
+ * `num_audio_tracks = k + 1` for a mistyped k would create k + 1 decode branches.
  */
-async function stromHasAudioEncoder(strom: StromClient): Promise<boolean> {
-  try {
-    const { blocks } = await strom.blocks.list();
-    return blocks.some((b) => b.id === 'builtin.audioenc');
-  } catch {
-    return true;
-  }
+export const MAX_APPLIED_AUDIO_STREAM_INDEX = 7;
+
+/**
+ * Whether Strom's `builtin.mpegtssrt_input` maps `audio_out_<k>` to the k-th
+ * audio stream in ascending PID order (spec §5.3 rule 3, ADR-010). The predicate
+ * is defined by the upstream follow-up Eyevinn/strom#1081, which has not landed,
+ * so this is `false` for every Strom today. Wiring an unordered `audio_out_k` is
+ * the #510 failure mode, so the answer must stay `false` until the real
+ * capability signal exists — do not guess it.
+ */
+function stromMapsAudioByPid(): boolean {
+  return false;
+}
+
+/**
+ * Decide whether an SRT/EFP source's selected audio stream can be applied
+ * (spec §5.4). Returns `null` when nothing needs reporting (k = 0, or applied),
+ * otherwise the reason the input is clamped to the first stream. A `null` for
+ * k > 0 means "apply k": the `num_audio_tracks` / `audio_out_<k>` / drain wiring
+ * for that case (spec §8 step 3) is gated on strom#1081 and is only reachable
+ * once `stromMapsAudioByPid()` can return true.
+ */
+export function audioStreamNotAppliedReason(
+  streamType: SourceDoc['streamType'],
+  audioStreamIndex: number | undefined,
+  capability: boolean,
+): AudioStreamNotAppliedReason | null {
+  const k = audioStreamIndex ?? 0;
+  if (k <= 0) return null;
+  if (streamType === 'efp') return 'stream-type-unsupported';
+  if (k > MAX_APPLIED_AUDIO_STREAM_INDEX) return 'stream-not-present';
+  if (!capability) return 'strom-capability-missing';
+  return null;
+}
+
+const AUDIO_STREAM_REASON_TEXT: Record<AudioStreamNotAppliedReason, string> = {
+  'stream-type-unsupported': 'Audio stream selection is only supported for MPEG-TS/SRT sources.',
+  'strom-capability-missing': 'This Strom cannot select an audio stream by PID yet.',
+  'stream-not-present': `Only audio streams 1-${MAX_APPLIED_AUDIO_STREAM_INDEX + 1} can be selected.`,
+};
+
+export interface ActivationInputRecorder extends InputRecorder {
+  sourceId: string;
+  sourceName: string;
+  streamType: StreamType;
+}
+
+/**
+ * Whether Strom has a block, memoised per activation so it lists blocks once.
+ * If the list can't be read, assume it does: the flow create/start that
+ * follows reports an unreachable Strom better than a guess here would.
+ */
+function stromBlockCheck(strom: StromClient): (blockId: string) => Promise<boolean> {
+  let ids: Promise<Set<string> | null> | undefined;
+  return async (blockId) => {
+    ids ??= (async () => {
+      try {
+        const { blocks } = await strom.blocks.list();
+        return new Set(blocks.map((b) => b.id));
+      } catch {
+        return null;
+      }
+    })();
+    const known = await ids;
+    return !known || known.has(blockId);
+  };
 }
 
 /** `builtin.mixer`'s own `min_upstream_latency` default (strom `types/src/mixer.rs`). */
@@ -118,6 +206,39 @@ function findPgmFeedPad(flow: FlowTopology): string | null {
       (b as Record<string, unknown>)['name'] === 'Enc PGM',
   ) as Record<string, unknown> | undefined;
   if (encPgm) return `${encPgm['id'] as string}:video_out`;
+  return null;
+}
+
+/**
+ * Feed pad for WHEP viewers and guest returns: the shared low-bitrate program
+ * encode (`Enc View`, issue #413). Kept separate from `findPgmFeedPad` so the
+ * recorder, RTMP and SRT outputs stay on the full-rate `Enc PGM` encode while
+ * WHEP consumers avoid whepserversink's GCC pacing of the 10 Mbit/s stream.
+ *
+ * Prefers the feed link of the template's static `PGM Output` WHEP block (which
+ * default-flow.ts wires from `Enc View`), falling back to the `Enc View` block's
+ * `encoded_out` pad so this tracks the template wiring.
+ */
+function findViewerFeedPad(flow: FlowTopology): string | null {
+  const pgmOutput = flow.blocks.find(
+    (b) =>
+      (b as Record<string, unknown>)['block_definition_id'] === 'builtin.whep_output' &&
+      (b as Record<string, unknown>)['name'] === 'PGM Output',
+  ) as Record<string, unknown> | undefined;
+  if (pgmOutput) {
+    const outputId = pgmOutput['id'] as string;
+    const feedLink = flow.links.find((link) => {
+      const l = link as Record<string, unknown>;
+      return ((l['to'] as string | undefined) ?? '') === `${outputId}:video_in`;
+    }) as Record<string, unknown> | undefined;
+    if (feedLink) return feedLink['from'] as string;
+  }
+  const encView = flow.blocks.find(
+    (b) =>
+      (b as Record<string, unknown>)['block_definition_id'] === 'builtin.videoenc' &&
+      (b as Record<string, unknown>)['name'] === 'Enc View',
+  ) as Record<string, unknown> | undefined;
+  if (encView) return `${encView['id'] as string}:encoded_out`;
   return null;
 }
 
@@ -200,6 +321,7 @@ export async function activateStromFlow(
 
   const pgmBitrate = typeof production.values?.bitrate === 'number' ? production.values.bitrate : undefined;
   const multiviewBitrate = typeof production.values?.multiview_bitrate === 'number' ? production.values.multiview_bitrate : undefined;
+  const viewerBitrate = typeof production.values?.viewer_bitrate === 'number' ? production.values.viewer_bitrate : undefined;
   const pgmFramerate = typeof production.values?.pgm_framerate === 'string' ? production.values.pgm_framerate : undefined;
   const multiviewResolution = typeof production.values?.multiview_resolution === 'string' ? production.values.multiview_resolution : undefined;
   const multiviewFramerate = typeof production.values?.multiview_framerate === 'string' ? production.values.multiview_framerate : undefined;
@@ -274,6 +396,10 @@ export async function activateStromFlow(
         props['bitrate'] = multiviewBitrate;
         b['properties'] = props;
       }
+      if (name === 'Enc View' && viewerBitrate !== undefined) {
+        props['bitrate'] = viewerBitrate;
+        b['properties'] = props;
+      }
     }
 
     if (b['block_definition_id'] === 'builtin.mixer') {
@@ -313,6 +439,10 @@ export async function activateStromFlow(
   // builtin.whep_output is intentionally kept — it carries the multiview stream
   // that the controller's WHEP viewer connects to via /blocks/{id}/multiview-endpoint.
   const pgmFeedPad = findPgmFeedPad(flow);
+  // WHEP viewers + guest returns feed from the low-bitrate Enc View encode (issue
+  // #413); recorder/RTMP/SRT stay on pgmFeedPad (Enc PGM). Falls back to pgmFeedPad
+  // if the template ever lacks an Enc View block, so viewers never lose video.
+  const viewerFeedPad = findViewerFeedPad(flow) ?? pgmFeedPad;
 
   // Strip only SRT/EFP program output blocks from the template.
   // User-assigned outputs are injected below; the template's WHEP block stays.
@@ -441,18 +571,78 @@ export async function activateStromFlow(
     a.mixerInput.localeCompare(b.mixerInput),
   );
 
-  // Set num_inputs on the vision mixer based solely on the number of dynamic sources.
-  // All static template video inputs are stripped above, so no static pad count needed.
-  // Allowed values: 2, 4, 6, 8, 10 (non-live property — must be set at creation).
-  // Also set input_{N}_label for each assigned source so Strom renders the name
-  // in the multiview overlay (verified: property format from strom/backend/src/blocks/builtin/vision_mixer/properties.rs).
-  const numSourceInputs = Math.max(2, sortedAssignments.length);
+  // Compact stored mixer-input pads to a contiguous 0..N-1 range for the live
+  // Strom flow (issue #463). Studio allocates guest slots from the top of the
+  // mixer-input range DOWN (video_in_15, video_in_14, …; see the "Guest N"
+  // labelling below and open-live-studio#171), so a production with e.g. 4
+  // sources (video_in_0..3) and 2 guest slots (video_in_15/14) would, if the
+  // mixer were sized by the highest stored pad, get a 16-input mixer whose tiles
+  // video_in_4..13 are empty. Instead we size the mixer to exactly what the
+  // production uses and renumber every assigned pad to a dense index, ordered by
+  // the NUMERIC stored pad index ascending (NOT the lexical `localeCompare` order
+  // `sortedAssignments` uses — "video_in_15" sorts before "video_in_4" as a
+  // string). The STORED mixerInput stays the stable external identity: invites,
+  // return feeds and the controller all key off it, and the WS layer translates
+  // stored↔compact only at the Strom boundary (see `mixerInputMap` in
+  // controller.ts). Identity for a contiguous-from-0 production.
+  const storedPadIndexOf = (mixerInput: string): number | null => {
+    const m = /video_in_(\d+)$/.exec(mixerInput);
+    return m ? parseInt(m[1], 10) : null;
+  };
+  const mixerInputMap: Record<string, number> = {};
+  [...production.sources]
+    .filter((a) => storedPadIndexOf(a.mixerInput) !== null)
+    .sort((a, b) => storedPadIndexOf(a.mixerInput)! - storedPadIndexOf(b.mixerInput)!)
+    .forEach((a, i) => { mixerInputMap[a.mixerInput] = i; });
+  /** Compact Strom pad index for an assignment (falls back to the stored index). */
+  const stromPadOf = (mixerInput: string): number | null =>
+    mixerInputMap[mixerInput] ?? storedPadIndexOf(mixerInput);
+
+  // Set num_inputs on the vision mixer so that EVERY (compacted) assigned pad
+  // exists. All static template video inputs are stripped above, so no static pad
+  // count needed. Allowed values: 2, 4, 6, 8, … (non-live property — must be set
+  // at creation). Also set input_{N}_label for each assigned source so Strom
+  // renders the name in the multiview overlay (verified: property format from
+  // strom/backend/src/blocks/builtin/vision_mixer/properties.rs).
+  //
+  // The vision mixer exposes pads video_in_0 … video_in_{num_inputs-1}
+  // (strom-block-config.md), so a mixer with num_inputs=N only has pads 0..N-1.
+  // Because the pads are now compacted to 0..N-1 (above), sizing by the compacted
+  // count is both sufficient (every wired pad exists — the #436 "guest picture
+  // never reaches the mixer" invariant) and tight (no empty tiles — issue #463).
+  const numSourceInputs = Math.max(2, Object.keys(mixerInputMap).length);
+
+  // Guest-slot numbering (issues #458, #464). A guest slot is a source assignment
+  // carrying a `returnFeed` (the same definition the guest routes and
+  // assignReturnBuses use). A WHIP guest slot's source resolves only to the
+  // generic virtual-source name ("WHIP Input", audio-channels.ts), so both the
+  // Strom multiviewer (input_{N}_label, below) and the audio mixer strips
+  // (ch{N}_label, in the per-source loop) would otherwise show that generic name
+  // instead of the Studio controller's "Guest N" tile (open-live-studio#171).
+  // Number the guest slots exactly the way the controller does — returnFeed
+  // assignments ordered by trailing pad index DESCENDING (slots are allocated
+  // from the top of the input range down, so the highest index is Guest 1) — so
+  // the multiviewer AND the audio mixer agree with the controller. This single
+  // shared map is the source of truth for both labels; do not re-derive the
+  // numbering (e.g. from returnBuses order, which is ascending) anywhere else.
+  // Updating the label to the invite/guest name live while a guest is joined is a
+  // separate (live) concern and out of scope here.
+  const guestSlotPadIndex = (mixerInput: string): number =>
+    parseInt(/(\d+)$/.exec(mixerInput)?.[1] ?? '0', 10);
+  const guestSlotNumber = new Map<string, number>();
+  [...production.sources]
+    .filter((a) => !!a.returnFeed)
+    .sort((a, b) => guestSlotPadIndex(b.mixerInput) - guestSlotPadIndex(a.mixerInput))
+    .forEach((a, i) => guestSlotNumber.set(a.mixerInput, i + 1));
 
   if (mixerBlock && mixerBlockId) {
-    // num_inputs = real sources only, rounded up to Strom's allowed range (2..16).
+    // Round up to Strom's allowed even range (2,4,6,8,10,…) and clamp to the
+    // MAX_NUM_INPUTS=16 ceiling. Rounding up only ever adds an unused (black,
+    // never-selectable) pad, so it can never remove a pad a source needs.
     // PiPs are a separate first-class concept in Strom 0.5+ — set via num_pips, NOT
-    // by expanding num_inputs. max num_inputs is 16 per Strom's MAX_NUM_INPUTS constant.
-    const numTotalInputs = Math.max(2, Math.min(16, numSourceInputs));
+    // by expanding num_inputs.
+    const roundedUp = numSourceInputs % 2 === 0 ? numSourceInputs : numSourceInputs + 1;
+    const numTotalInputs = Math.max(2, Math.min(16, roundedUp));
     const props = (mixerBlock['properties'] ?? {}) as Record<string, unknown>;
     props['num_inputs'] = String(numTotalInputs);
 
@@ -461,13 +651,29 @@ export async function activateStromFlow(
     const configuredPips = Number(production.values?.num_pips ?? 0);
     props['num_pips'] = String(Math.min(4, Math.max(0, configuredPips)));
 
-    // Label source inputs
+    // Label source inputs on the multiviewer — at the COMPACT pad the input is
+    // actually wired to (issue #463), so the overlay labels line up with the real
+    // tiles. A WHIP guest slot takes the controller's "Guest N" label (from the
+    // shared guestSlotNumber map above) in preference to the generic "WHIP Input"
+    // virtual-source name; Strom would otherwise fall back to its default "In N+1".
+    // Every other input keeps its own source name. (issues #458, #463, #464)
     for (const assignment of sortedAssignments) {
-      const padMatch = /video_in_(\d+)$/.exec(assignment.mixerInput);
-      if (!padMatch) continue;
-      const padIndex = parseInt(padMatch[1], 10);
+      const padIndex = stromPadOf(assignment.mixerInput);
+      if (padIndex === null) continue;
       const src = sourceMap.get(assignment.sourceId) ?? (VIRTUAL_SOURCES[assignment.sourceId] as SourceDoc | undefined);
-      if (src?.name) {
+      const guestNum = assignment.returnFeed && src?.streamType === 'whip'
+        ? guestSlotNumber.get(assignment.mixerInput)
+        : undefined;
+      if (guestNum !== undefined) {
+        // ADR-007 Option C (guest tiles only): carry the operator's stored Studio
+        // slot number into the overlay label (e.g. "Guest 1 · In 6") so it matches
+        // the slot the guest was placed in, while the physical pad stays the
+        // #463-compacted index. Sources (the `src.name` branch) are unchanged.
+        props[`input_${padIndex}_label`] = withGuestSlotStudioInputSuffix(
+          `Guest ${guestNum}`,
+          assignment.mixerInput,
+        );
+      } else if (src?.name) {
         props[`input_${padIndex}_label`] = src.name;
       }
     }
@@ -519,6 +725,12 @@ export async function activateStromFlow(
       }
       Object.assign(props, returnSendMatrix(rb.auxBus, rb.ownChannel, rb.mode, numChannels));
     }
+    // Seed persisted audio processing (issue #527, OL-25) at flow BUILD time so
+    // it survives deactivate/reactivate. This includes the construction-time
+    // ch{N}_hpf_enabled flag (Strom marks it live:false), which is why it must
+    // be applied here rather than over the live block-properties PATCH — hence
+    // the "takes effect on next activation" note on the HPF on/off control.
+    Object.assign(props, buildStromPropsFromStore(production.audioProcessing));
     audioMixerBlock['properties'] = props;
   }
 
@@ -563,21 +775,36 @@ export async function activateStromFlow(
   // Maps mixerInput → time_offset block ID — returned so the WS layer can apply live changes.
   const sourceOffsetBlockIds: Record<string, string> = {};
   const sourceAudioOffsetBlockIds: Record<string, string> = {};
+  const warnings: ActivationWarning[] = [];
   // Maps mixerInput → builtin.media_player block ID for 'clip' sources — returned so the
   // clip cue/play control surface (#277/#278) can target the player block by mixer input.
   const clipPlayerBlockIds: Record<string, string> = {};
+  // Inputs whose assignment asks for a recording, with the decoded pads a
+  // recorder can tap; only arriving feeds have them.
+  const inputTaps: Array<InputTap & { source: SourceDoc; sourceId: string; mode: InputRecordMode }> = [];
 
   for (const assignment of sortedAssignments) {
     const padMatch = /video_in_(\d+)$/.exec(assignment.mixerInput);
     if (!padMatch || !mixerBlockId) continue;
+    // `padIndex` is the STORED pad index — it keys the deterministic block/element
+    // IDs (`b-input-N`, `b-offset-N`, `e-html-N`, the `Offset V{N}` block names the
+    // activation route re-resolves by) so those reconstruction paths keep working.
+    // `stromPad` is the COMPACT index the input is actually wired to on the mixer
+    // (issue #463) — used for the mixer pad link targets and layout only.
     const padIndex = parseInt(padMatch[1], 10);
+    const stromPad = mixerInputMap[assignment.mixerInput] ?? padIndex;
 
     const source = sourceMap.get(assignment.sourceId) ?? (VIRTUAL_SOURCES[assignment.sourceId] as SourceDoc | undefined);
     if (!source) continue;
     const audioChannel = audioChannelByAssignment.get(assignment)!;
 
-    const yPos = ROW_START + padIndex * ROW_H;
+    const yPos = ROW_START + stromPad * ROW_H;
     const inputId = `b-input-${padIndex}-${endpointSuffix}`;
+    const tapInput = (videoPad: string, audioPad: string) => {
+      const mode = assignment.record ?? 'off';
+      if (mode === 'off') return;
+      inputTaps.push({ mixerInput: assignment.mixerInput, padIndex, videoPad, audioPad, source, sourceId: assignment.sourceId, mode });
+    };
 
     // Insert a time_offset block between this source and the vision mixer.
     // Starts at 0 ms; operators adjust it live via SOURCE_OFFSET_SET WS messages.
@@ -590,8 +817,8 @@ export async function activateStromFlow(
       position: { x: COL_OFFSET, y: yPos },
     });
     sourceOffsetBlockIds[assignment.mixerInput] = offsetId;
-    // Final link: offset → mixer (applies to all source types below)
-    flow.links.push({ from: `${offsetId}:out`, to: `${mixerBlockId}:${assignment.mixerInput}` });
+    // Final link: offset → mixer compact pad (applies to all source types below).
+    flow.links.push({ from: `${offsetId}:out`, to: `${mixerBlockId}:video_in_${stromPad}` });
 
     const TEST_PATTERNS: Record<string, string> = { test1: 'Pinwheel', test2: 'Colors' }
     if (source.streamType === 'test1' || source.streamType === 'test2') {
@@ -634,7 +861,7 @@ export async function activateStromFlow(
       });
       sourceAudioOffsetBlockIds[assignment.mixerInput] = audioOffsetId;
       flow.links.push({ from: `${audioElemId}:src`, to: `${audioOffsetId}:in` });
-      flow.links.push({ from: `${audioOffsetId}:out`, to: `${mixerBlockId}:audio_in_${padIndex}` });
+      flow.links.push({ from: `${audioOffsetId}:out`, to: `${mixerBlockId}:audio_in_${stromPad}` });
       if (audioMixerBlock && audioMixerBlockId) {
         flow.links.push({ from: `${audioOffsetId}:out`, to: `${audioMixerBlockId}:input_${audioChannel + 1}` });
         if (source.name) {
@@ -674,7 +901,7 @@ export async function activateStromFlow(
       sourceAudioOffsetBlockIds[assignment.mixerInput] = audioOffsetId;
       flow.links.push({ from: `${demuxId}:audio`, to: `${audioOffsetId}:in` });
       // Audio to vision mixer and audio mixer both come from the delay block.
-      flow.links.push({ from: `${audioOffsetId}:out`, to: `${mixerBlockId}:audio_in_${padIndex}` });
+      flow.links.push({ from: `${audioOffsetId}:out`, to: `${mixerBlockId}:audio_in_${stromPad}` });
       if (audioMixerBlock && audioMixerBlockId) {
         flow.links.push({ from: `${audioOffsetId}:out`, to: `${audioMixerBlockId}:input_${audioChannel + 1}` });
         if (source.name) {
@@ -734,7 +961,7 @@ export async function activateStromFlow(
       });
       sourceAudioOffsetBlockIds[assignment.mixerInput] = audioOffsetIdClip;
       flow.links.push({ from: `${playerId}:audio_out`, to: `${audioOffsetIdClip}:in` });
-      flow.links.push({ from: `${audioOffsetIdClip}:out`, to: `${mixerBlockId}:audio_in_${padIndex}` });
+      flow.links.push({ from: `${audioOffsetIdClip}:out`, to: `${mixerBlockId}:audio_in_${stromPad}` });
       if (audioMixerBlock && audioMixerBlockId) {
         flow.links.push({ from: `${audioOffsetIdClip}:out`, to: `${audioMixerBlockId}:input_${audioChannel + 1}` });
         if (source.name) {
@@ -763,17 +990,45 @@ export async function activateStromFlow(
       });
       sourceAudioOffsetBlockIds[assignment.mixerInput] = audioOffsetIdWhip;
       flow.links.push({ from: `${inputId}:audio_out`, to: `${audioOffsetIdWhip}:in` });
-      flow.links.push({ from: `${audioOffsetIdWhip}:out`, to: `${mixerBlockId}:audio_in_${padIndex}` });
+      tapInput(`${inputId}:video_out`, `${inputId}:audio_out`);
+      flow.links.push({ from: `${audioOffsetIdWhip}:out`, to: `${mixerBlockId}:audio_in_${stromPad}` });
       if (audioMixerBlock && audioMixerBlockId) {
         flow.links.push({ from: `${audioOffsetIdWhip}:out`, to: `${audioMixerBlockId}:input_${audioChannel + 1}` });
-        if (source.name) {
+        // A WHIP guest slot's audio strip takes the same "Guest N" label as its
+        // multiviewer tile (from the shared guestSlotNumber map) in preference to
+        // the generic "WHIP Input" virtual-source name, so the audio mixer agrees
+        // with the multiviewer and the Studio controller. A plain WHIP input with
+        // no returnFeed keeps its own source name. (issue #464)
+        const guestNum = assignment.returnFeed ? guestSlotNumber.get(assignment.mixerInput) : undefined;
+        const label = guestNum !== undefined ? `Guest ${guestNum}` : source.name;
+        if (label) {
           const props = (audioMixerBlock['properties'] ?? {}) as Record<string, unknown>;
-          props[`ch${audioChannel + 1}_label`] = source.name;
+          props[`ch${audioChannel + 1}_label`] = label;
           audioMixerBlock['properties'] = props;
         }
       }
     } else {
       // srt → builtin.mpegtssrt_input, efp → builtin.efpsrt_input
+      // Audio-stream selection (spec §5.3/§5.4, ADR-010): until Strom maps
+      // audio_out_<k> by PID order (strom#1081) every k > 0 is clamped to the
+      // first stream — the block and links stay byte-identical to k = 0 — and
+      // the operator gets a warning on this input.
+      const notApplied = audioStreamNotAppliedReason(source.streamType, source.audioStreamIndex, stromMapsAudioByPid());
+      if (notApplied) {
+        const requestedIndex = source.audioStreamIndex ?? 0;
+        const label = `${source.name} (${source.streamType === 'efp' ? 'EFP' : 'SRT'})`;
+        warnings.push({
+          type: 'audio-stream-not-applied',
+          sourceId: assignment.sourceId,
+          mixerInput: assignment.mixerInput,
+          requestedIndex,
+          appliedIndex: 0,
+          reason: notApplied,
+          message:
+            `${label}: audio stream ${requestedIndex + 1} was not applied, using stream 1. ` +
+            AUDIO_STREAM_REASON_TEXT[notApplied],
+        });
+      }
       flow.blocks.push({
         id: inputId,
         block_definition_id: source.streamType === 'efp' ? 'builtin.efpsrt_input' : 'builtin.mpegtssrt_input',
@@ -797,7 +1052,8 @@ export async function activateStromFlow(
       });
       sourceAudioOffsetBlockIds[assignment.mixerInput] = audioOffsetId;
       flow.links.push({ from: `${inputId}:audio_out_0`, to: `${audioOffsetId}:in` });
-      flow.links.push({ from: `${audioOffsetId}:out`, to: `${mixerBlockId}:audio_in_${padIndex}` });
+      tapInput(`${inputId}:video_out`, `${inputId}:audio_out_0`);
+      flow.links.push({ from: `${audioOffsetId}:out`, to: `${mixerBlockId}:audio_in_${stromPad}` });
       if (audioMixerBlock && audioMixerBlockId) {
         flow.links.push({ from: `${audioOffsetId}:out`, to: `${audioMixerBlockId}:input_${audioChannel + 1}` });
         if (source.name) {
@@ -921,8 +1177,12 @@ export async function activateStromFlow(
   // Inject output blocks for each assigned OutputDoc
   const whepOutputEntries: Array<{ outputId: string; endpointId: string }> = [];
   let recorderBlockId: string | undefined;
+  let recorderOutputId: string | undefined;
   let recorderOutputDir: string | undefined;
-  const warnings: ActivationWarning[] = [];
+  const hasBlock = stromBlockCheck(strom);
+  // Each activation records into its own directory, named by its start time, so
+  // deactivate can tell which activation recorded each file.
+  const recordingsDir = `${productionRecordingsDir(production._id)}/${activationRecordingsDirName()}`;
   let outputBlockIndex = 0;
   if (outputDocs && outputDocs.length > 0) {
     for (const outputDoc of outputDocs) {
@@ -932,20 +1192,26 @@ export async function activateStromFlow(
       const idSlug = outputDoc._id.replace(/[^a-z0-9]/gi, '').slice(-8) || 'out';
       const blockId = `b-out-${idSlug}-${endpointSuffix}`;
       if (outputDoc.outputType === 'recording') {
-        // VOD recording: emit a single builtin.recorder block that writes local
+        // VOD recording: emit a single builtin.liverecorder block that writes local
         // segments in Strom. open-live uploads them to MinIO after deactivate
         // (recording-uploader.ts). Only one recorder is wired per production —
         // extra 'recording' assignments are ignored so we never fan-out writes.
         if (recorderBlockId) continue;
-        // Per-production output directory: recorder writes
-        // {media_path}/{output_dir}/{filename_prefix}_{timestamp}_%05d.{ext} (Strom recorder.rs). We key
-        // it by production id so segments are trivially locatable + uploadable.
-        // Each activation gets its own subdirectory, named by its start time, so
-        // deactivate can tell which activation recorded each file.
-        const outputDir = `${productionRecordingsDir(production._id)}/${activationRecordingsDirName()}`;
+        // Strom refuses to start a flow that names a block it lacks, so a Strom
+        // without Live Recorder goes on air unrecorded instead of not at all.
+        if (!(await hasBlock('builtin.liverecorder'))) {
+          warnings.push({
+            type: 'recording-unavailable',
+            message: `Recording "${outputDoc.name}" is off: this Strom has no builtin.liverecorder block.`,
+          });
+          continue;
+        }
+        // Recorder writes {media_path}/{output_dir}/{filename_prefix}_{timestamp}_%05d.{ext}
+        // (Strom live_recorder/mod.rs).
+        const outputDir = recordingsDir;
         flow.blocks.push({
           id: blockId,
-          block_definition_id: 'builtin.recorder',
+          block_definition_id: 'builtin.liverecorder',
           name: outputDoc.name,
           properties: {
             output_dir: outputDir,
@@ -958,7 +1224,7 @@ export async function activateStromFlow(
         // so audio needs builtin.audioenc. Strom older than 0.6.9 lacks it and
         // refuses to start the whole flow if it is referenced; record picture
         // only rather than keep the production off air.
-        if (mainAudioSource && !(await stromHasAudioEncoder(strom))) {
+        if (mainAudioSource && !(await hasBlock('builtin.audioenc'))) {
           warnings.push({
             type: 'recording-no-audio',
             message:
@@ -978,6 +1244,7 @@ export async function activateStromFlow(
           flow.links.push({ from: `${audioEncId}:encoded_out`, to: `${blockId}:audio_in_0` });
         }
         recorderBlockId = blockId;
+        recorderOutputId = outputDoc._id;
         recorderOutputDir = outputDir;
         outputBlockIndex++;
       } else if (outputDoc.outputType === 'whep') {
@@ -994,7 +1261,8 @@ export async function activateStromFlow(
           },
           position: { x: COL_OUTPUT, y: ROW_START + outputBlockIndex * ROW_H },
         });
-        if (pgmFeedPad) flow.links.push({ from: pgmFeedPad, to: `${blockId}:video_in` });
+        // WHEP viewers get the low-bitrate Enc View encode (issue #413).
+        if (viewerFeedPad) flow.links.push({ from: viewerFeedPad, to: `${blockId}:video_in` });
         if (mainAudioSource) {
           flow.links.push({ from: mainAudioSource, to: `${blockId}:audio_in` });
           let audioTrack = 1;
@@ -1058,6 +1326,71 @@ export async function activateStromFlow(
     }
   }
 
+  // Per-input recording (`ProductionSourceAssignment.record`): recorders for
+  // each opted-in arriving feed, beside the program recording
+  // (src/lib/input-recording.ts).
+  const inputRecorders: ActivationInputRecorder[] = [];
+  const tapped = new Set(inputTaps.map((t) => t.mixerInput));
+  for (const { mixerInput, record } of sortedAssignments) {
+    if (record && record !== 'off' && !tapped.has(mixerInput)) {
+      warnings.push({
+        type: 'input-recording-incomplete',
+        message: `${mixerInput} is not recorded: only WHIP, SRT and EFP inputs can be recorded on their own.`,
+      });
+    }
+  }
+  const transcodeTaps = inputTaps.filter((tap) => {
+    if (tap.mode === 'transcode') return true;
+    warnings.push({
+      type: 'input-recording-incomplete',
+      message: `${tap.mixerInput} is not recorded: ${tap.mode} recording is not supported yet.`,
+    });
+    return false;
+  });
+  if (transcodeTaps.length > 0) {
+    const [recorder, video, audio] = await Promise.all(
+      ['builtin.liverecorder', 'builtin.videoenc', 'builtin.audioenc'].map((id) => hasBlock(id)),
+    );
+    const support = { video: recorder && video, audio: recorder && audio };
+    if (!support.video && !support.audio) {
+      warnings.push({
+        type: 'input-recording-incomplete',
+        message: recorder
+          ? 'Inputs are not recorded: this Strom has neither builtin.videoenc nor builtin.audioenc.'
+          : 'Inputs are not recorded: this Strom has no builtin.liverecorder block.',
+      });
+    } else {
+      if (!support.audio) {
+        warnings.push({
+          type: 'input-recording-incomplete',
+          message: 'Inputs are recorded without sound: this Strom has no builtin.audioenc block. ' +
+            'Upgrade Strom to 0.6.9 or later to record audio.',
+        });
+      }
+      if (!support.video) {
+        warnings.push({
+          type: 'input-recording-incomplete',
+          message: 'Inputs are recorded without picture: this Strom has no builtin.videoenc block.',
+        });
+      }
+      for (const tap of transcodeTaps) {
+        const recorder = addTranscodingInputRecorder(flow, tap, {
+          productionId: production._id,
+          activationDir: recordingsDir,
+          idSuffix: endpointSuffix,
+          support,
+          position: { x: COL_ELEM - 900, y: ROW_START + (mixerInputMap[tap.mixerInput] ?? tap.padIndex) * ROW_H },
+        });
+        inputRecorders.push({
+          ...recorder,
+          sourceId: tap.sourceId,
+          sourceName: tap.source.name,
+          streamType: tap.source.streamType,
+        });
+      }
+    }
+  }
+
   // Per-guest return WHEP outputs (epic #208, issue #300). One builtin.whep_output
   // per guest carrying the program video (v1 picture source = program output over
   // WHEP, OQ7) plus exactly one audio track — that guest's return aux bus. A mode
@@ -1076,7 +1409,8 @@ export async function activateStromFlow(
         properties: { endpoint_id: endpointId, low_latency: true, mode: 'audio_video', num_audio_tracks: 1 },
         position: { x: COL_OUTPUT, y: ROW_START + outputBlockIndex * ROW_H },
       });
-      if (pgmFeedPad) flow.links.push({ from: pgmFeedPad, to: `${blockId}:video_in` });
+      // Guest returns get the low-bitrate Enc View encode (issue #413).
+      if (viewerFeedPad) flow.links.push({ from: viewerFeedPad, to: `${blockId}:video_in` });
       flow.links.push({ from: `${audioMixerBlockId}:aux_out_${rb.auxBus}`, to: `${blockId}:audio_in` });
       returnWhepEntries.push({ mixerInput: rb.assignment.mixerInput, endpointId });
       outputBlockIndex++;
@@ -1241,8 +1575,11 @@ export async function activateStromFlow(
     whepOutputEntries: whepOutputEntries.length > 0 ? whepOutputEntries : undefined,
     pgmWhepEndpointId,
     recorderBlockId,
+    recorderOutputId,
     recorderOutputDir,
     warnings,
+    ...((recorderBlockId || inputRecorders.length > 0) && { recordingsDir }),
+    inputRecorders,
     sourceOffsetBlockIds,
     sourceAudioOffsetBlockIds,
     clipPlayerBlockIds,
@@ -1253,6 +1590,7 @@ export async function activateStromFlow(
       mode: rb.mode,
     })),
     returnWhepEntries,
+    mixerInputMap,
     fastWhepEntries: fastFeedRouter ? fastPlan!.entries : [],
     ...(fastFeedRouter && { fastFeedRouter }),
   };

@@ -16,9 +16,14 @@ import { deactivateStromFlow } from '../lib/flow-generator.js';
 import { getSubscriberCount } from './tally.service.js';
 import { clearProductionPflState } from './pfl-state.js';
 import { clearAudioState, clearPipState, clearFxState } from '../ws/controller.js';
+import { forceStopMeterRelay } from './meter-relay.js';
+import { forceStopClipRelay } from './clip-relay.js';
 import { broadcast } from './tally.service.js';
 import { activationAbortControllers, updateProductionDoc, emitProductionStatus } from '../routes/productions.js';
+import { sweepGuestsOnProductionEnd } from './guest-sweep.js';
 import { stoppedStatus } from '../lib/production-health.js';
+import { settleOnStop } from './gpu-usage.js';
+import { closeRecordingIndex } from './recording-index.js';
 import type { ProductionDoc } from '../db/types.js';
 
 // Idle deadline is config-driven (issue #290, env IDLE_TIMEOUT_SEC, default 300s
@@ -234,10 +239,17 @@ export async function deactivateProduction(productionId: string, log: FastifyBas
     activationAbortControllers.delete(doc._id);
   }
 
+  await closeRecordingIndex(doc._id);
   clearProductionPflState(doc._id);
   clearAudioState(doc._id);
   clearPipState(doc._id);
   clearFxState(doc._id);
+  // Force-stop both relays regardless of refCount — same stale-relay hazard as
+  // the explicit deactivate path (issue #416): controller sockets survive the
+  // idle auto-deactivate, so the relays must be torn down here too or a connect
+  // after reactivation ref-counts into a relay bound to the old flow.
+  forceStopMeterRelay(doc._id, doc.stromFlowId);
+  forceStopClipRelay(doc._id, doc.stromFlowId);
   broadcast(doc._id, { type: 'GRP_STATE_RESET' });
 
   if (doc.stromFlowId) {
@@ -250,20 +262,29 @@ export async function deactivateProduction(productionId: string, log: FastifyBas
     }
   }
 
+  // Revoke guest invites and end live guest sessions (issue #414); best-effort.
+  await sweepGuestsOnProductionEnd(doc._id, log);
+
   // Transition rule (spec §1): an `active` production auto-deactivated for idle
   // becomes `ended` (it broadcast and then stopped); one still `activating`
   // becomes `inactive` (it never reached a live broadcast).
   const nextStatus = stoppedStatus(doc.status);
+  // Settle shared-GPU usage up to now (final partial hour included) and clear the
+  // accrual start, same obligation as the explicit deactivate path (issue #500).
+  const settledGpuHours = settleOnStop(doc);
   await updateProductionDoc(doc._id, {
     status: nextStatus,
     endedReason: nextStatus === 'ended' ? 'idle' : undefined,
     autoDeactivated: true,
+    activatedAt: undefined,
+    ...(settledGpuHours ? { gpuHours: settledGpuHours } : {}),
     stromFlowId: undefined,
     mixerBlockId: undefined,
     audioMixerBlockId: undefined,
     loudnessMainBlockId: undefined,
     recorderBlockId: undefined,
     recorderOutputDir: undefined,
+    inputRecorderBlockIds: undefined,
     sourceOffsetBlockIds: undefined,
     sourceAudioOffsetBlockIds: undefined,
     whepEndpoint: undefined,

@@ -10,6 +10,8 @@ import { encryptAddressPassphrase, decryptAddressPassphrase } from '../lib/srt-p
 import { encryptHtmlAuthValue } from '../lib/html-auth-crypto.js';
 import { getPortReservation } from '../services/port-reservation.js';
 import { clashesAfterWrite, listenerPortRequest, resolveListenerAddress, usedListenerPorts } from '../services/listener-ports.js';
+import { getWhipIngestState } from '../services/whip-ingest-state.js';
+import { getAllClipStates } from '../services/clip-state.service.js';
 
 /**
  * Token-header name allowlist for a Design-B auth header (issue #314,
@@ -123,6 +125,9 @@ const SourceInput = z.object({
   status: z.enum(['active', 'inactive']).default('inactive'),
   liveCamera: z.boolean().optional(),
   latency: z.number().int().min(20).max(8000).optional(),
+  // Optional 0-based audio elementary-stream index (ADR-006 Decision 1). SRT/EFP only
+  // (enforced in the route handler); absent => 0. Non-live property: no 409 guard.
+  audioStreamIndex: z.number().int().min(0).optional(),
   // Optional id of the Gateway that registered this source (OL-5, spec
   // studio-gateways.md). Absent for manually-created sources; when present it
   // must name an existing gateway (validated in the route handler).
@@ -141,6 +146,9 @@ const SourcePatch = z.object({
   status: z.enum(['active', 'inactive']).optional(),
   liveCamera: z.boolean().optional(),
   latency: z.number().int().min(20).max(8000).optional(),
+  // Optional 0-based audio elementary-stream index (ADR-006 Decision 1). SRT/EFP only
+  // (enforced in the route handler); absent => 0. Non-live property: no 409 guard.
+  audioStreamIndex: z.number().int().min(0).optional(),
   // A gateway can re-tag or clear a source's gateway link. `null` clears the
   // link (unlinks the source); a string re-links it to an (existing) gateway.
   gatewayId: z.string().nullable().optional(),
@@ -216,6 +224,26 @@ async function isSourceInActiveProduction(sourceId: string): Promise<string | nu
   return (active.docs[0] as unknown as Pick<ProductionDoc, 'name'>).name;
 }
 
+/**
+ * Name of an active production in which the clip source is currently `playing`
+ * in some slot (per the in-memory clip-state registry, which tracks the loaded
+ * source id as `clipId`), or null. Editing a clip source's address is allowed
+ * while it is merely assigned/cued (takes effect at the next Cue) but not while
+ * it is on air.
+ */
+async function clipSourcePlayingIn(sourceId: string): Promise<string | null> {
+  // A clip may be cued into ANY slot of an active production, not only the one
+  // it is assigned to, so scan every active production's tracked clip states.
+  const active = await getDb().findTrusted({
+    selector: { type: 'production', status: { $in: ['active', 'activating'] } },
+    fields: ['_id', 'name'],
+  });
+  for (const p of active.docs as unknown as Array<Pick<ProductionDoc, '_id' | 'name'>>) {
+    if (getAllClipStates(p._id).some((c) => c.state === 'playing' && c.clipId === sourceId)) return p.name;
+  }
+  return null;
+}
+
 async function gatewayExists(gatewayId: string): Promise<boolean> {
   try {
     await getGatewaysDb().get(gatewayId);
@@ -245,6 +273,20 @@ function toApi(doc: SourceDoc) {
     // stored; the value itself is write-only and never included (issue #314).
     api['auth'] = maskAuth(auth, authHeaderValueEnc);
   }
+  // Read-only, separate from the client-writable `status` field: the observed
+  // WHIP live-ingest state (issue #439, interim — parent #437). Present only
+  // once a WHIP offer/teardown has been seen for this source; absent otherwise.
+  // Driven by `src/routes/whip.ts` and held in process memory (resets on
+  // restart). Clients may read it but CANNOT set it — a client-supplied
+  // `liveIngest` on create/patch is ignored (not in the input schemas), so this
+  // never overwrites `status`.
+  //
+  // KNOWN INTERIM LIMITATION: a publisher that drops without sending a WHIP
+  // DELETE stays `connected` here — see `src/services/whip-ingest-state.ts`.
+  const liveIngest = getWhipIngestState(_id);
+  if (liveIngest) {
+    api['liveIngest'] = { state: liveIngest.state, changedAt: liveIngest.changedAt };
+  }
   return api;
 }
 
@@ -271,11 +313,18 @@ function maskAuth(auth: HtmlSourceAuth, authHeaderValueEnc: string | undefined):
 
 const sourcesRoutes: FastifyPluginAsync = async (fastify) => {
   // List all sources
-  fastify.get('/api/v1/sources', async (_req, reply) => {
+  fastify.get<{ Querystring: { streamType?: string } }>('/api/v1/sources', async (req, reply) => {
     const db = getSourcesDb();
+    // Optional ?streamType= filter (e.g. `clip` so a UI can list available clips).
+    const streamTypeParsed = z.enum(['srt', 'efp', 'whip', 'html', 'clip']).optional().safeParse(req.query?.streamType);
+    if (!streamTypeParsed.success) {
+      return reply.status(400).send({ error: 'Invalid streamType filter', statusCode: 400 });
+    }
     let result: Awaited<ReturnType<typeof db.find>>;
     try {
-      result = await db.find({ selector: { type: 'source' } });
+      result = await db.find({
+        selector: { type: 'source', ...(streamTypeParsed.data ? { streamType: streamTypeParsed.data } : {}) },
+      });
     } catch (err) {
       fastify.log.warn({ err }, 'GET /api/v1/sources — DB query failed');
       return reply.status(503).send({ error: 'Database unavailable' });
@@ -293,6 +342,9 @@ const sourcesRoutes: FastifyPluginAsync = async (fastify) => {
       return reply.status(400).send({ error: `Gateway "${body.gatewayId}" not found`, statusCode: 400 });
     }
     const isSrt = body.streamType === 'srt' || body.streamType === 'efp';
+    if (body.audioStreamIndex !== undefined && !isSrt) {
+      return reply.status(400).send({ error: 'audioStreamIndex is only valid for srt/efp sources', statusCode: 400 });
+    }
     const id = `src-${randomUUID()}`;
     // A listener source binds a port on the shared Strom: it must lie inside this
     // instance's lease and no other source or output may hold it. Port 0 asks
@@ -323,6 +375,7 @@ const sourcesRoutes: FastifyPluginAsync = async (fastify) => {
         status: body.status,
         liveCamera: body.liveCamera,
         latency: body.latency,
+        ...(body.audioStreamIndex !== undefined ? { audioStreamIndex: body.audioStreamIndex } : {}),
         // Only persist gatewayId when supplied — existing clients omit it and
         // the field stays absent, keeping the doc backward-compatible.
         ...(body.gatewayId !== undefined ? { gatewayId: body.gatewayId } : {}),
@@ -369,6 +422,9 @@ const sourcesRoutes: FastifyPluginAsync = async (fastify) => {
       // while the stored doc.address may hold an encrypted passphrase.
       const effectiveStreamType = body.streamType ?? doc.streamType;
       const effectiveAddress = body.address ?? decryptAddressPassphrase(doc.address);
+      if (body.audioStreamIndex !== undefined && effectiveStreamType !== 'srt' && effectiveStreamType !== 'efp') {
+        return reply.status(400).send({ error: 'audioStreamIndex is only valid for srt/efp sources', statusCode: 400 });
+      }
       if (effectiveAddress) {
         try {
           if (effectiveStreamType === 'html') {
@@ -425,6 +481,15 @@ const sourcesRoutes: FastifyPluginAsync = async (fastify) => {
         const activeName = await isSourceInActiveProduction(doc._id);
         if (activeName !== null) {
           return reply.status(409).send({ error: `Source auth cannot be changed while in use by active production "${activeName}"`, statusCode: 409 });
+        }
+      }
+      // A clip source may be re-addressed while assigned/cued in an active
+      // production (the change takes effect at the next Cue), but not while it
+      // is currently playing in a slot.
+      if (doc.streamType === 'clip' && body.address !== undefined) {
+        const playingIn = await clipSourcePlayingIn(doc._id);
+        if (playingIn !== null) {
+          return reply.status(409).send({ error: `Clip source is playing in active production "${playingIn}"; stop it before changing its address`, statusCode: 409 });
         }
       }
       // Encrypt the passphrase in an updated address before persisting. When the
@@ -507,6 +572,28 @@ const sourcesRoutes: FastifyPluginAsync = async (fastify) => {
     }
     await getSourcesDb().insert(updated);
     return reply.send(toApi(updated));
+  });
+
+  // Read-only audio-stream discovery (ADR-006 Decision 3). The stream list is
+  // derived at read time, never persisted. Until the Strom probe capability
+  // exists (#516) it always reports `unavailable`; `selectedIndex` is local
+  // state and always present (absent audioStreamIndex => 0).
+  fastify.get<{ Params: { id: string } }>('/api/v1/sources/:id/audio-streams', async (req, reply) => {
+    let doc: SourceDoc;
+    try {
+      doc = await getSourcesDb().get(req.params.id);
+    } catch (err: unknown) {
+      if (err && typeof err === 'object' && 'statusCode' in err && (err as { statusCode: number }).statusCode === 404) {
+        return reply.status(404).send({ error: 'Source not found', statusCode: 404 });
+      }
+      throw err;
+    }
+    return reply.send({
+      selectedIndex: doc.audioStreamIndex ?? 0,
+      discovery: 'unavailable' as const,
+      reason: 'strom-probe-unsupported' as const,
+      streams: null,
+    });
   });
 
   // Design-C interactive-login provisioning — GATED. Stock upstream cefsrc has

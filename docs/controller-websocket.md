@@ -23,10 +23,42 @@ security fix for exactly that gap. Subscriber counts are also observable by oper
 through `GET /api/v1/productions/{id}/controllers`. In short, the code already treats
 this as a first-class surface that carries live production commands.
 
-**Read-only observers are technically supported.** A client may connect, never send an
-inbound message, and simply consume the outbound broadcasts (for example to observe
-mixer cuts). Nothing in the handler requires a client to send anything; the connection
-receives a state snapshot on connect and all subsequent broadcasts.
+**Read-only observers should connect watch-only** (see [Watch-only connections](#watch-only-connections)).
+A plain connection that never sends anything is still an operator connection: if it is
+the first one after (re)activation it runs the audio-mixer reset, and it keeps the
+production alive against the idle watchdog.
+
+## Watch-only connections
+
+```
+WS /ws/productions/:id/controller?mode=watch
+```
+
+For passive consumers such as tally loggers. Authentication is unchanged. A watch-only
+connection:
+
+- receives the same connect-time snapshot (ending in `SNAPSHOT_END`) and every broadcast;
+- may not send commands. Every inbound frame is answered with a `NACK` (when it carries a
+  `cmdId`) or an `ERROR`, and has no effect. This includes `KEEP_ALIVE`;
+- never runs the first-connect audio-mixer reset. That still happens on the first
+  operator connection, however many watchers connected before it;
+- makes no other Strom writes and seeds no server-side state that would change what a later
+  operator connection does. A persisted PiP layout or clip cue is reported but left for the
+  next operator connect to restore;
+- does not count in `GET /api/v1/productions/{id}/controllers` `count` (it is reported
+  in `watchers`) or in the list endpoint's `subscriberCount`, and does not reset the idle
+  timer, so watchers alone do not keep a production alive;
+- starts the meter relay, so `METER_DATA` and `LOUDNESS_DATA` arrive with only watchers
+  connected; subscribing to Strom's meters writes nothing. It does not start the clip relay,
+  so relayed `CLIP_STATE` updates arrive only while an operator connection is open.
+
+Before any operator has connected, the snapshot's `AUDIO_STATE` mute values come from
+Strom's `chN_to_main` routing rather than the server's mute registry. When the first
+operator connection then resets the mixer, the new channel and main values are broadcast as
+`AUDIO_STATE`, so watchers that connected earlier follow the reset.
+
+Any other `mode` value is rejected: the server sends an `ERROR` and closes with code 1008,
+rather than treating the connection as an operator.
 
 > **Stability note (TBD by maintainers).** What is documented below reflects the message
 > contract as implemented in `src/ws/controller.ts` at the time of writing. Whether that
@@ -119,6 +151,7 @@ otherwise ignored. The inbound type union (`src/ws/controller.ts`):
 | `DSK_TOGGLE` | `layer: number`, `visible?: boolean` | Toggle a downstream keyer layer |
 | `MACRO_EXEC` | `macroId: string` | Execute a stored macro |
 | `AUDIO_SET` | `elementId: string`, `property: 'volume' \| 'mute'`, `value: unknown`, `ramp_ms?: number` | Set a channel/main fader or mute |
+| `AUDIO_PROC_SET` | `elementId: 'chN' \| 'main'`, `stage: 'gain' \| 'hpf' \| 'gate' \| 'comp' \| 'eq' \| 'limiter'`, `params: {...}` | Set one audio processing stage (issue #527, OL-25). `params` is partial (move one knob) and range-validated against the Strom ranges — an out-of-range value is rejected (`NACK`/`ERROR`) and nothing reaches Strom (no silent clamp). Stage/element rules: `limiter` and the main `comp`/`eq` are main-only; `gain`/`hpf`/`gate` are channel-only. Params by stage: `gain` → `{gain:-20..20 dB}`; `hpf` → `{enabled?, freq?:20..500 Hz}`; `gate` → `{enabled?, threshold?:-60..0 dB, attack?:0.1..200 ms, release?:10..1000 ms}`; `comp` → `{enabled?, threshold?:-60..0 dB, ratio?:1..20, attack?:0.1..200 ms, release?:10..1000 ms, makeup?:0..24 dB, knee?:-24..0 dB}`; `eq` → `{enabled?, bands?: [{band:1..4, freq?:20..20000 Hz, gain?:-15..15 dB, q?:0.1..10}]}`; `limiter` → `{enabled?, threshold?:-20..0 dB}`. One Strom block-properties PATCH per message, debounced per `elementId:stage` and coalesced under the rate limit (`AUDIO_PROC_SET` is in `coalesceKey`). Persisted on the production and re-applied on activation; excluded from the connect-time mixer reset. The HPF on/off flag (`hpf.enabled`) is a **construction-time** Strom property — persisted and applied at flow build, so it **takes effect on next activation** (the HPF cutoff `hpf.freq` is live). The main limiter sits **before** the master fader until `Eyevinn/strom#1023` is fixed, and is not defaulted on here. With a `cmdId`: `ACK accepted` then `ACK executed` after the Strom write (or persist, when a change is construction-time-only or the production is inactive), `NACK {cmdId, error}` on a rejected value or Strom error. Without a `cmdId`, failures send `ERROR`. |
 | `AFV_SET` | `mixerInput: string`, `enabled: boolean` | Enable/disable audio-follows-video for an input |
 | `AFV_RAMP_SET` | `rampUpMs: number`, `rampDownMs: number` | Set the AFV ramp times |
 | `PFL_SET` | `elementId: string`, `enabled: boolean`, `volume?: number` | Pre-fade listen on a strip |
@@ -135,11 +168,11 @@ otherwise ignored. The inbound type union (`src/ws/controller.ts`):
 | `SET_PIP` | `pip: number`, `bg: number \| null`, `zones: PipZone[]`, `transforms?: PipTransforms` | Configure a PiP slot |
 | `SET_EFFECT` | `target: EffectTarget`, `effect: VideoEffect` | Set a video effect on an input or master |
 | `HTML_SOURCE_EVENT` | `sourceId: string`, `params: Record<string,string>`, `mode?: 'merge' \| 'replace'` | Forward operator params into an HTML source's URL query and reload the running `cefsrc`. `merge` (default) updates/adds keys on the current effective query; `replace` sets it to exactly `params`. The resulting URL is re-validated with `graphicUrl()` (SSRF/scheme gate). |
-| `CLIP_CUE` | `mixerInput: string`, `clipId?: string` | Load the clip source assigned to `mixerInput` into its media-player block and hold it ready (`setPlaylist` + `goto index 0`, leaving the player paused at the start). Broadcasts `CLIP_STATE` `cued` — but only once the clip's URL has passed a reachability preflight and Strom has confirmed a loaded duration; otherwise `CLIP_STATE` `error` (issue #351, see below). The cue point is persisted on `ProductionDoc.clipCues`, surviving deactivate/reactivate and server restart (restored to `cued`, never auto-playing). |
-| `CLIP_PLAY` | `mixerInput: string` | Start playback of the cued clip (`control play`). Rejected (`ERROR` + `CLIP_STATE` `error`) if nothing is cued on that input. Broadcasts `CLIP_STATE` `playing`; subsequent transitions/position arrive reactively (with the poll as a reconciliation fallback). |
-| `CLIP_PAUSE` | `mixerInput: string` | Pause playback (`control pause`). Broadcasts `CLIP_STATE` `paused` and stops the reconciliation poll. |
-| `CLIP_STOP` | `mixerInput: string` | Stop playback (`control stop`). Broadcasts `CLIP_STATE` `stopped`, stops the reconciliation poll, and clears the persisted cue. |
-| `CLIP_SEEK` | `mixerInput: string`, `positionMs: number` | Seek within the clip (`seek position_ms`); `positionMs` is a non-negative integer (0 … 24 h). Broadcasts the resulting `CLIP_STATE`. |
+| `CLIP_CUE` | `mixerInput: string`, `clipId?: string` | Load a clip source into `mixerInput`'s media-player block and hold it ready. `clipId` (optional) is a clip SOURCE id (`streamType: clip`, see `GET /api/v1/sources?streamType=clip`) chosen at Cue time (OL-19); omitted, the source assigned to `mixerInput` is loaded. An unknown or non-clip `clipId` fails as `ERROR`/`NACK` (404 equivalent). On-air guard: a Cue with `clipId` is refused (`NACK`/`ERROR`, no `CLIP_STATE` change) while the slot's player is `playing` — send `CLIP_STOP` first. `CLIP_STATE.clipId` and the persisted cue follow the loaded source; on reactivate/reconnect the persisted source is re-cued (falling back to the assigned default if it was deleted). The load is `setPlaylist` + `goto index 0`, leaving the player paused at the start. Broadcasts `CLIP_STATE` `cued` — but only once the clip's URL has passed a reachability preflight and Strom has confirmed a loaded duration; otherwise `CLIP_STATE` `error` (issue #351, see below). The cue point is persisted on `ProductionDoc.clipCues`, surviving deactivate/reactivate and server restart (restored to `cued`, never auto-playing). With a `cmdId` the command is acknowledged `ACK accepted` then `ACK executed` (sent after the `CLIP_STATE` broadcast), or `NACK {cmdId, error}` on failure (instead of `ERROR`; the `CLIP_STATE` `error` broadcast is unchanged). Without a `cmdId`: no ACK/NACK, failures send `ERROR`. |
+| `CLIP_PLAY` | `mixerInput: string` | Start playback of the cued clip (`control play`). Rejected (`ERROR` + `CLIP_STATE` `error`) if nothing is cued on that input. Broadcasts `CLIP_STATE` `playing`; subsequent transitions/position arrive reactively (with the poll as a reconciliation fallback). With a `cmdId` the command is acknowledged `ACK accepted` then `ACK executed` (sent after the `CLIP_STATE` broadcast), or `NACK {cmdId, error}` on failure (instead of `ERROR`; the `CLIP_STATE` `error` broadcast is unchanged). Without a `cmdId`: no ACK/NACK, failures send `ERROR`. |
+| `CLIP_PAUSE` | `mixerInput: string` | Pause playback (`control pause`). Broadcasts `CLIP_STATE` `paused` and stops the reconciliation poll. With a `cmdId` the command is acknowledged `ACK accepted` then `ACK executed` (sent after the `CLIP_STATE` broadcast), or `NACK {cmdId, error}` on failure (instead of `ERROR`; the `CLIP_STATE` `error` broadcast is unchanged). Without a `cmdId`: no ACK/NACK, failures send `ERROR`. |
+| `CLIP_STOP` | `mixerInput: string` | Stop playback (`control stop`). Broadcasts `CLIP_STATE` `stopped`, stops the reconciliation poll, and clears the persisted cue. With a `cmdId` the command is acknowledged `ACK accepted` then `ACK executed` (sent after the `CLIP_STATE` broadcast), or `NACK {cmdId, error}` on failure (instead of `ERROR`; the `CLIP_STATE` `error` broadcast is unchanged). Without a `cmdId`: no ACK/NACK, failures send `ERROR`. |
+| `CLIP_SEEK` | `mixerInput: string`, `positionMs: number` | Seek within the clip (`seek position_ms`); `positionMs` is a non-negative integer (0 … 24 h). Broadcasts the resulting `CLIP_STATE`. With a `cmdId` the command is acknowledged `ACK accepted` then `ACK executed` (sent after the `CLIP_STATE` broadcast), or `NACK {cmdId, error}` on failure (instead of `ERROR`; the `CLIP_STATE` `error` broadcast is unchanged). Without a `cmdId`: no ACK/NACK, failures send `ERROR`. |
 | `RETURN_SET` | `mixerInput: string`, `mode: 'program' \| 'program-minus'` | Crew switch a guest's synced return mode (epic #208, issue #301). Shares `applyReturnMode` with the crew REST route and the guest token route: persist + apply the send matrix live + broadcast `RETURN_STATE`. `NACK`/`ERROR` when the input has no return feed, the mode is invalid, or the production is not active. |
 | `KEEP_ALIVE` | — | Client activity / liveness signal (issue #290). Resets the production's idle timer and cancels any pending idle warning; when a warning was outstanding this broadcasts `IDLE_WARNING_CLEARED`. Needs no production doc, so it is handled before the doc fetch the other commands require. |
 
@@ -159,7 +192,7 @@ are emitted from `src/ws/controller.ts` and `src/services/meter-relay.ts`:
 
 | `type` | Fields | Emitted when |
 |---|---|---|
-| `TALLY` | `pgm: string \| null`, `pvw: string \| null`, `pgmBg: string \| null`, `transitionType?: string`, `durationMs?: number` | Tally (PGM/PVW) changes; also sent on connect |
+| `TALLY` | `pgm: string \| null`, `pvw: string \| null`, `pgmBg: string \| null`, `pgmPip: number \| null`, `pvwPip: number \| null`, `program: string[]`, `preview: string[]`, `contributions: Array<{ source: string; role: 'main' \| 'pip-bg' \| 'pip-inset' \| 'dsk' \| 'graphic' }>`, `transitionType?: string`, `durationMs?: number` | Tally (PGM/PVW) changes; also sent on connect |
 | `PIP_STATE` | `pgmPip: number \| null`, `pvwPip: number \| null`, `pips: PipConfig[]` | PiP program/preview/config changes; also sent on connect |
 | `FTB_STATE` | `active: boolean` | Fade-to-black state changes |
 | `ON_AIR` | `value: boolean` | Production goes on/off air (`GO_LIVE` / `CUT_STREAM`) |
@@ -168,7 +201,8 @@ are emitted from `src/ws/controller.ts` and `src/services/meter-relay.ts`:
 | `DSK_STATE` | `layer: number`, `visible: boolean` | A DSK layer toggles; also replayed on connect |
 | `MACRO_EXECUTED` | `macroId: string` | A macro completed successfully |
 | `MACRO_ERROR` | `macroId: string`, `failedActionIndex: number`, `error: string` | A macro action failed (sent to originating socket) |
-| `AUDIO_STATE` | `elementId: string`, `property: 'volume' \| 'mute'`, `value: unknown` | A channel/main fader or mute changes; also replayed on connect |
+| `AUDIO_STATE` | `elementId: string`, `property: 'volume' \| 'mute'`, `value: unknown` | A channel/main fader or mute changes; also replayed on connect; also broadcast for each audio-follow-video channel whose `chN_to_main` is switched at a cut (`property: 'mute'`, `value` = !routed, as reported by Strom) |
+| `AUDIO_PROC_STATE` | `elementId: 'chN' \| 'main'`, `stage: 'gain' \| 'hpf' \| 'gate' \| 'comp' \| 'eq' \| 'limiter'`, `params: {...}`, `applied?: true` | An audio processing stage changes (issue #527, OL-25). Broadcast optimistically on `AUDIO_PROC_SET`, then re-broadcast with `applied: true` once the debounced write reaches Strom. Replayed on connect for every stage that differs from default (params completed with the Strom defaults); a production that never set any processing replays nothing. |
 | `AFV_STATE` | `mixerInput: string`, `enabled: boolean` | AFV toggled for an input; also replayed on connect |
 | `AFV_RAMP_STATE` | `rampUpMs: number`, `rampDownMs: number` | AFV ramp times change; also sent on connect |
 | `PFL_STATE` | `elementId: string`, `enabled: boolean` | PFL state changes; also replayed on connect |
@@ -183,6 +217,7 @@ are emitted from `src/ws/controller.ts` and `src/services/meter-relay.ts`:
 | `SOURCE_AUDIO_OFFSET_STATE` | `mixerInput: string`, `offsetMs: number` | A per-source audio offset changes; also replayed on connect |
 | `FX_STATE` | `fxAvailable: boolean`, `inputEffects: VideoEffect[]`, `masterEffect: VideoEffect` | Video-effect state changes; also sent on connect |
 | `HTML_SOURCE_STATE` | `sourceId: string`, `params: Record<string,string>`, `effectiveUrl: string`, `updatedAt: string` | An HTML source's forwarded params changed (after a successful `HTML_SOURCE_EVENT`); also replayed on connect. In-memory only — resets on server restart. |
+| `SOURCE_INGEST_STATE` | `sourceId: string`, `state: 'connected' \| 'disconnected'`, `changedAt: string` | A WHIP source's observed live-ingest state changed (issue #439, interim — parent #437): `connected` when its WHIP offer succeeds, `disconnected` on the WHIP teardown (DELETE). Broadcast only on a real change; the current state for each assigned source is also replayed on connect. Also exposed read-only as the `liveIngest` field on source REST responses (separate from the client-writable `status`). In-memory only — resets on server restart. **Known interim limitation:** a publisher that drops without sending DELETE stays `connected`; the robust Strom-session-event version is a separate out-of-scope issue. |
 | `CLIP_STATE` | `mixerInput: string`, `state: 'idle' \| 'cued' \| 'playing' \| 'paused' \| 'stopped' \| 'completed' \| 'error'`, `clipId?: string`, `positionMs?: number`, `durationMs?: number`, `error?: string` | A clip transitions on `mixerInput` (cue/play/pause/stop/seek), reaches end-of-media (`completed`), or a clip operation fails (`error`); also sent on connect for each clip source |
 | `METER_DATA` | `elementId: string`, `peak`, `rms` | Audio meter tick (relayed from Strom); `elementId` is `main`, `monitor`, `ch{N}`, `aux{N}`, or `grp{N}` |
 | `LOUDNESS_DATA` | `elementId: 'main'`, `momentary`, `shortterm`, `integrated`, `loudness_range`, `true_peak` | EBU R128 loudness tick (relayed from Strom) |
@@ -190,13 +225,25 @@ are emitted from `src/ws/controller.ts` and `src/services/meter-relay.ts`:
 | `IDLE_WARNING_CLEARED` | `productionId: string` | A pending idle warning was cancelled because activity reset the idle timer (a subscriber joined or a `KEEP_ALIVE` was received). |
 | `RETURN_STATE` | `mixerInput: string`, `mode: 'program' \| 'program-minus'` | A per-guest return feed's mix-minus mode changed on `mixerInput` (crew via `PUT .../returns/{mixerInput}/mode`, the `RETURN_SET` WS command, or the guest via `PUT /api/v1/guests/{inviteId}/session/return`). `program-minus` closes that guest's own send; `program` opens it (epic #208, issue #300). Also emitted once per configured return during the connect-time snapshot. |
 | `GUEST_STATE` | `guestId: string`, `mixerInput: string`, `state: 'invited' \| 'joined' \| 'previewing' \| 'on-air' \| 'left' \| 'error'`, `label?`, `intercomLine?` | A guest's lifecycle state changed (epic #208, issue #301). Broadcast on the persisted join/leave/kick transitions and emitted once per live guest in the connect-time snapshot. `previewing`/`on-air` are **derived** from the live vision-mixer contribution set (#209); a guest composited only as a PiP *inset* reads `joined` until the PiP-inset tally gap #209 raises is closed. |
+| `GUEST_HEALTH` | `mixerInput: string`, `blockId: string`, `status: 'ok' \| 'failed'`, `detail?: string`, `causes?: object[]` | Strom's block health scan (Eyevinn/strom#786) reported a guest seat's input block (`b-input-<pad>-<suffix>`) stopped passing data (`failed`) or resumed (`ok`), while the pipeline stays PLAYING. `mixerInput` is the guest seat. `detail` is Strom's human-readable text, sent only while failed. `causes` is Strom's list of structured causes (e.g. `{ kind: 'whip_medium', slot, medium, fault }`), passed through unchanged while failed when Strom sends them. Strom re-sends a failed event when `causes` changes, so a seat can get consecutive `failed` messages. Relayed through the meter relay, so live changes reach clients only while a controller socket (operator or watcher) is connected; the relay re-reads `block_health` each time its Strom socket opens, so a change during a reconnect is not lost. Also emitted once per guest seat in the connect-time snapshot and after reactivation, from the flow's `block_health` (a seat Strom does not list reads `ok`). |
 | `ERROR` | `error: string` | An inbound frame was invalid or an operation failed (sent to originating socket). Also carries each activation warning (`ProductionDoc.activationWarnings`, e.g. a recording with no sound): broadcast when the production goes active, and sent to each client that connects while it is active. Not a response to any command. |
 
 `pgmBg` is the mixer input a PiP on program is composited over. It is `null` unless
-`PIP_STATE.pgmPip` is set, so the two fields together distinguish an empty program
+`pgmPip` is set — the same PiP-slot index that `TALLY` now carries directly (and that
+`PIP_STATE.pgmPip` also reports) — so the two fields together distinguish an empty program
 (`pgmPip` null) from a PiP over a known input (both set) from a PiP over nothing
 (`pgmPip` set, `pgmBg` null). It is not tracked across the `MACRO_EXEC` cut,
 transition, and take paths, which leave it holding the value from before the macro.
+
+`pgmPip` / `pvwPip` are the PiP-slot indices currently on program / preview, with the
+same meaning as the identically-named `PIP_STATE` fields (`null` when no PiP is on that
+bus). `program` and `preview` are the sets of mixer-input pads contributing to each bus,
+and `contributions` is the richer per-source breakdown — one `{ source, role }` entry per
+contributing source, where `role` is `main` (the primary PGM/PVW input), `pip-bg` (the real
+input behind a PiP), `pip-inset` (a source inside a PiP zone), `dsk` (a visible keyer layer,
+surfaced as `dsk:<layer>`), or `graphic` (an active overlay, surfaced as `gfx:<overlayId>`).
+These contribution fields have been part of the `TALLY` payload since the automation-control
+contract landed (#209); `pgmPip` / `pvwPip` were added in #482.
 
 ### Connect-time snapshot
 
@@ -204,12 +251,14 @@ On connect (and when a production is active), the server pushes a snapshot of cu
 state to the new socket before any further broadcasts: `TALLY`, `OVL_STATE` (if set),
 `PIP_STATE`, any `DSK_STATE` layers, per-channel and master `AUDIO_STATE` /
 `AUX_MASTER_STATE` / `GRP_MASTER_STATE` / `MONITOR_STATE`, `AUX_SEND_STATE`,
-`GRP_SEND_STATE` (or `GRP_STATE_RESET`), `AFV_STATE`, `PFL_STATE` / `AFL_STATE`,
+`GRP_SEND_STATE` (or `GRP_STATE_RESET`), `AUDIO_PROC_STATE` (one per processing
+stage that differs from default — issue #527), `AFV_STATE`, `PFL_STATE` / `AFL_STATE`,
 `SOURCE_OFFSET_STATE` / `SOURCE_AUDIO_OFFSET_STATE`, `AFV_RAMP_STATE`, `FX_STATE`,
 `HTML_SOURCE_STATE` (per HTML source with forwarded params), `CLIP_STATE` (one per
 clip source — a `mixerInput` present in `clipPlayerBlockIds`), `GUEST_STATE` (one per
-live guest session, `left` excluded) and `RETURN_STATE` (one per configured return
-feed — epic #208, issue #301).
+live guest session, `left` excluded), `RETURN_STATE` (one per configured return
+feed — epic #208, issue #301) and `GUEST_HEALTH` (one per guest seat, when Strom
+answered the flow fetch).
 This lets a freshly-connected client rebuild the full control state without sending
 any inbound messages. See the connect handler in `src/ws/controller.ts` for the exact
 ordering.

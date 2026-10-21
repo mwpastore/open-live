@@ -1,8 +1,8 @@
 import type { FastifyPluginAsync } from 'fastify';
 import { randomUUID } from 'crypto';
 import { z } from 'zod';
-import { getOutputsDb, getDb } from '../db/index.js';
-import type { OutputDoc, ProductionDoc, OutputStatus, RtmpDestination } from '../db/types.js';
+import { getOutputsDb, getDb, getStorageConnectionsDb } from '../db/index.js';
+import type { OutputDoc, ProductionDoc, OutputStatus, RtmpDestination, StorageConnectionDoc } from '../db/types.js';
 import { updateProductionDoc } from './productions.js';
 import { deriveOutputStatus } from '../lib/production-health.js';
 import { srtUrl } from '../lib/url-validation.js';
@@ -11,6 +11,8 @@ import { encryptStreamKey } from '../lib/rtmp-credentials-crypto.js';
 import { resolveIngestUrl, validateStreamKey } from '../lib/rtmp.js';
 import { resolveSrtConnect } from '../lib/srt-connect.js';
 import { config } from '../config.js';
+import { DEFAULT_CONNECTION_ID } from '../lib/storage-connection.js';
+import { isDocNotFoundError } from '../lib/db-errors.js';
 import { getPortReservation } from '../services/port-reservation.js';
 import { clashesAfterWrite, listenerPortRequest, resolveListenerAddress, usedListenerPorts } from '../services/listener-ports.js';
 
@@ -77,6 +79,28 @@ async function outputInActiveProduction(outputId: string): Promise<boolean> {
   });
 }
 
+/**
+ * Why a `recording` output with this `connectionId` names an unusable storage
+ * connection, or null when it is fine (issue #534). A named connection must
+ * exist and name a bucket. No connection (or the reserved `"default"`) is always
+ * accepted: without MINIO_* the recording stays on Strom and is not uploaded.
+ */
+async function recordingTargetError(connectionId: string | undefined): Promise<string | null> {
+  if (!connectionId || connectionId === DEFAULT_CONNECTION_ID) {
+    return null;
+  }
+  let conn: StorageConnectionDoc;
+  try {
+    conn = await getStorageConnectionsDb().get(connectionId);
+  } catch (err) {
+    // 404, or an id that names a document of another type (the type guard).
+    if (isDocNotFoundError(err)) return 'Storage connection not found';
+    throw err;
+  }
+  // Recordings upload into the connection's default bucket (resolveStorageTarget).
+  return conn.defaultBucket ? null : 'Storage connection has no default bucket';
+}
+
 // RTMP destination fields on create/patch. `streamKey` is write-only (accepted
 // here, never returned); `ingestUrl` is only honoured for the 'custom' platform
 // — named presets resolve their ingest URL server-side from the static table.
@@ -91,8 +115,15 @@ const OutputInput = z.object({
   outputType: z.enum(['mpegtssrt', 'efpsrt', 'whep', 'recording', 'rtmp']),
   url: z.string().optional(),
   rtmp: RtmpInput.optional(),
+  // Optional storage connection for a `recording` output (issue #520). Absent =
+  // the default (env) connection, exactly as today. Must exist (checked in the
+  // handler, issue #534) so a bad id is a 400 here, not a silent upload failure.
+  connectionId: z.string().min(1).max(128).optional(),
 }).superRefine((data, ctx) => {
   const isRtmp = data.outputType === 'rtmp';
+  if (data.connectionId !== undefined && data.outputType !== 'recording') {
+    ctx.addIssue({ code: z.ZodIssueCode.custom, path: ['connectionId'], message: 'connectionId is only valid on a recording output' });
+  }
   // `rtmp` must be present on an rtmp output and absent on every other type.
   if (isRtmp && !data.rtmp) {
     ctx.addIssue({ code: z.ZodIssueCode.custom, path: ['rtmp'], message: 'rtmp is required for an rtmp output' });
@@ -137,6 +168,8 @@ const OutputPatch = z.object({
     streamKey: z.string().optional(),
     ingestUrl: z.string().optional(),
   }).optional(),
+  // Re-point a recording output at a different storage connection (issue #520).
+  connectionId: z.string().min(1).max(128).optional(),
 });
 
 /** Masks passphrase values in SRT URIs so credentials are never returned to clients. */
@@ -202,6 +235,12 @@ const outputsRoutes: FastifyPluginAsync = async (fastify) => {
 
   fastify.post('/api/v1/outputs', async (req, reply) => {
     const body = OutputInput.parse(req.body);
+    // A named storage connection must resolve; with none, the recording stays on
+    // Strom's disk (issues #41, #534).
+    if (body.outputType === 'recording') {
+      const targetError = await recordingTargetError(body.connectionId);
+      if (targetError) return reply.status(400).send({ error: targetError, statusCode: 400 });
+    }
     const id = `output-${randomUUID()}`;
     // RTMP is an outbound connect to the platform — it leases NO SRT listener
     // port (unlike the SRT-listener path below), so skip that branch entirely.
@@ -254,6 +293,8 @@ const outputsRoutes: FastifyPluginAsync = async (fastify) => {
         outputType: body.outputType,
         // Encrypt any embedded SRT passphrase before it touches CouchDB (issue #260).
         url: url !== undefined ? encryptAddressPassphrase(url) : url,
+        // Storage connection for a recording output (issue #520); absent = default.
+        ...(body.outputType === 'recording' && body.connectionId ? { connectionId: body.connectionId } : {}),
         createdAt: now,
         updatedAt: now,
       };
@@ -295,6 +336,13 @@ const outputsRoutes: FastifyPluginAsync = async (fastify) => {
       }
       if (doc.outputType === 'rtmp' && body.url !== undefined) {
         return reply.status(400).send({ error: 'url is not valid on an rtmp output', statusCode: 400 });
+      }
+      if (body.connectionId !== undefined && doc.outputType !== 'recording') {
+        return reply.status(400).send({ error: 'connectionId is only valid on a recording output', statusCode: 400 });
+      }
+      if (body.connectionId !== undefined) {
+        const targetError = await recordingTargetError(body.connectionId);
+        if (targetError) return reply.status(400).send({ error: targetError, statusCode: 400 });
       }
 
       // ---- RTMP patch: re-resolve ingestUrl, re-encrypt/clear/keep key ----

@@ -1,6 +1,6 @@
 import Nano from 'nano';
 import { config } from '../config.js';
-import type { ProductionDoc, SourceDoc, ProductionConfigDoc, GraphicDoc, OutputDoc, GatewayDoc, RecordingDoc, GuestInviteDoc, GuestSessionDoc, GuestSigningKeyDoc } from './types.js';
+import type { ProductionDoc, SourceDoc, ProductionConfigDoc, GraphicDoc, OutputDoc, GatewayDoc, RecordingDoc, GuestInviteDoc, GuestSessionDoc, GuestSigningKeyDoc, CredentialEncryptionKeyDoc, RtmpCredentialKeyDoc, MigrationStateDoc, GpuUsageLedgerDoc, GpuMeteringStateDoc, StorageConnectionDoc } from './types.js';
 
 
 let db: Nano.DocumentScope<ProductionDoc>;
@@ -158,6 +158,30 @@ export function getGuestSessionsDb(): GuardedScope<GuestSessionDoc> {
 
 export function getGuestSigningKeysDb(): GuardedScope<GuestSigningKeyDoc> {
   return withTypeGuard(db as unknown as Nano.DocumentScope<GuestSigningKeyDoc>, 'guest-signing-key');
+}
+
+export function getCredentialEncryptionKeysDb(): GuardedScope<CredentialEncryptionKeyDoc> {
+  return withTypeGuard(db as unknown as Nano.DocumentScope<CredentialEncryptionKeyDoc>, 'credential-encryption-key');
+}
+
+export function getRtmpCredentialKeysDb(): GuardedScope<RtmpCredentialKeyDoc> {
+  return withTypeGuard(db as unknown as Nano.DocumentScope<RtmpCredentialKeyDoc>, 'rtmp-credentials-key');
+}
+
+export function getMigrationStateDb(): GuardedScope<MigrationStateDoc> {
+  return withTypeGuard(db as unknown as Nano.DocumentScope<MigrationStateDoc>, 'migration-state');
+}
+
+export function getGpuUsageLedgerDb(): GuardedScope<GpuUsageLedgerDoc> {
+  return withTypeGuard(db as unknown as Nano.DocumentScope<GpuUsageLedgerDoc>, 'gpu-usage-ledger');
+}
+
+export function getGpuMeteringStateDb(): GuardedScope<GpuMeteringStateDoc> {
+  return withTypeGuard(db as unknown as Nano.DocumentScope<GpuMeteringStateDoc>, 'gpu-metering-state');
+}
+
+export function getStorageConnectionsDb(): GuardedScope<StorageConnectionDoc> {
+  return withTypeGuard(db as unknown as Nano.DocumentScope<StorageConnectionDoc>, 'storage-connection');
 }
 
 const DB_NAME = 'open-live';

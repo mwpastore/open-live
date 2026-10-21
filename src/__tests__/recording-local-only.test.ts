@@ -6,8 +6,7 @@
  *   - a `recording` output can be created with no MinIO vars set,
  *   - deactivate with no object storage tears down without splitNow/upload,
  *   - deactivate with object storage uploads as before,
- *   - a partial MinIO config is reported (startup warns) and does not upload,
- *   - the VOD endpoints return 503, since nothing was uploaded to list.
+ *   - a partial MinIO config is reported (startup warns) and does not upload.
  *
  * Config is read at import time, so the tests flip the exported `config`
  * object's MinIO fields directly. CouchDB, Strom, and the uploader are mocked.
@@ -155,20 +154,6 @@ describe('POST /api/v1/outputs — recording without object storage', () => {
   });
 });
 
-describe('VOD endpoints without object storage', () => {
-  it.each([
-    '/api/v1/productions/prod-rec-1/recordings',
-    '/api/v1/recordings',
-    '/api/v1/recordings/recording-1',
-  ])('GET %s returns 503', async (url) => {
-    mockGet.mockResolvedValue(makeRecordingProduction());
-    const app = await buildServer();
-    const res = await app.inject({ method: 'GET', url });
-    expect(res.statusCode).toBe(503);
-    expect(JSON.parse(res.body).error).toBe('Object storage unavailable');
-  });
-});
-
 describe('POST /api/v1/productions/:id/deactivate — recorder teardown', () => {
   it('skips splitNow and upload and still tears down when object storage is not configured', async () => {
     mockGet.mockResolvedValue(makeRecordingProduction());
@@ -177,7 +162,7 @@ describe('POST /api/v1/productions/:id/deactivate — recorder teardown', () => 
     const res = await app.inject({ method: 'POST', url: '/api/v1/productions/prod-rec-1/deactivate' });
 
     expect(res.statusCode).toBe(200);
-    expect(JSON.parse(res.body).status).toBe('inactive');
+    expect(JSON.parse(res.body).status).toBe('ended');
     expect(mockSplitNow).not.toHaveBeenCalled();
     expect(mockUploadRecordings).not.toHaveBeenCalled();
     expect(mockRecordingInsert).not.toHaveBeenCalled();
@@ -210,7 +195,7 @@ describe('POST /api/v1/productions/:id/deactivate — recorder teardown', () => 
     const res = await app.inject({ method: 'POST', url: '/api/v1/productions/prod-rec-1/deactivate' });
 
     expect(res.statusCode).toBe(200);
-    expect(mockSplitNow).toHaveBeenCalledWith('flow-rec', 'recorder-1');
+    expect(mockSplitNow).not.toHaveBeenCalled();
     expect(mockUploadRecordings).toHaveBeenCalledOnce();
     const uploadArgs = mockUploadRecordings.mock.calls[0][0] as { productionId: string; target: { bucket: string } };
     expect(uploadArgs.productionId).toBe('prod-rec-1');

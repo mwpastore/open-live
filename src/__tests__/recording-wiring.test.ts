@@ -1,7 +1,7 @@
 /**
  * Tests for the MinIO config + Strom recorder wiring slice (issue #41).
  *
- *  - flow-generator emits a builtin.recorder block wired to PGM + main audio and
+ *  - flow-generator emits a builtin.liverecorder block wired to PGM + main audio and
  *    returns recorderBlockId when a 'recording' output is assigned.
  *  - the upload-from-local uploader signs a SigV4 PutObject and pushes every
  *    local Strom segment to MinIO/S3, tolerating per-segment failures.
@@ -15,7 +15,7 @@ vi.mock('../db/index.js', () => ({
   getGraphicsDb: () => ({ get: vi.fn().mockRejectedValue(new Error('not found')) }),
 }));
 
-function makeStromClient(blockIds: string[] = ['builtin.recorder', 'builtin.audioenc']) {
+function makeStromClient(blockIds: string[] = ['builtin.liverecorder', 'builtin.audioenc']) {
   const capturedFlows: Record<string, unknown>[] = [];
   return {
     blocks: {
@@ -66,7 +66,7 @@ const recordingOutput = {
 describe('flow-generator — recorder wiring (#41)', () => {
   beforeEach(() => vi.clearAllMocks());
 
-  it('emits a builtin.recorder block wired to PGM + main audio and returns recorderBlockId', async () => {
+  it('emits a builtin.liverecorder block wired to PGM + main audio and returns recorderBlockId', async () => {
     const { activateStromFlow } = await import('../lib/flow-generator.js');
     const strom = makeStromClient();
     const production = makeProduction([{ sourceId: '__test1__', mixerInput: 'video_in_1' }]);
@@ -82,7 +82,7 @@ describe('flow-generator — recorder wiring (#41)', () => {
     const blocks = flow['blocks'] as Array<Record<string, unknown>>;
     const links = flow['links'] as Array<Record<string, unknown>>;
 
-    const recorder = blocks.find((b) => b['block_definition_id'] === 'builtin.recorder');
+    const recorder = blocks.find((b) => b['block_definition_id'] === 'builtin.liverecorder');
     expect(recorder).toBeDefined();
     const recId = recorder!['id'] as string;
     expect(result.recorderBlockId).toBe(recId);
@@ -119,7 +119,7 @@ describe('flow-generator — recorder wiring (#41)', () => {
 
   it('records picture only, with a warning, when Strom has no builtin.audioenc', async () => {
     const { activateStromFlow } = await import('../lib/flow-generator.js');
-    const strom = makeStromClient(['builtin.recorder']);
+    const strom = makeStromClient(['builtin.liverecorder']);
     const production = makeProduction([{ sourceId: '__test1__', mixerInput: 'video_in_1' }]);
 
     const result = await activateStromFlow(
@@ -138,6 +138,27 @@ describe('flow-generator — recorder wiring (#41)', () => {
     expect(links.find((l) => l['to'] === `${recId}:audio_in_0`)).toBeUndefined();
     expect(result.warnings).toEqual([
       expect.objectContaining({ type: 'recording-no-audio', message: expect.stringContaining('0.6.9') }),
+    ]);
+  });
+
+  it('records nothing, with a warning, when Strom has no builtin.liverecorder', async () => {
+    const { activateStromFlow } = await import('../lib/flow-generator.js');
+    const strom = makeStromClient(['builtin.recorder', 'builtin.audioenc']);
+    const production = makeProduction([{ sourceId: '__test1__', mixerInput: 'video_in_1' }]);
+
+    const result = await activateStromFlow(
+      production as never,
+      strom as never,
+      'http://localhost:7000',
+      [recordingOutput] as never,
+    );
+
+    const blocks = strom.capturedFlows[0]!['blocks'] as Array<Record<string, unknown>>;
+    expect(blocks.find((b) => String(b['block_definition_id']).includes('recorder'))).toBeUndefined();
+    expect(blocks.find((b) => b['block_definition_id'] === 'builtin.audioenc')).toBeUndefined();
+    expect(result.recorderBlockId).toBeUndefined();
+    expect(result.warnings).toEqual([
+      expect.objectContaining({ type: 'recording-unavailable', message: expect.stringContaining('builtin.liverecorder') }),
     ]);
   });
 
@@ -173,7 +194,7 @@ describe('flow-generator — recorder wiring (#41)', () => {
 
     const flow = strom.capturedFlows[0]!;
     const blocks = flow['blocks'] as Array<Record<string, unknown>>;
-    const recorders = blocks.filter((b) => b['block_definition_id'] === 'builtin.recorder');
+    const recorders = blocks.filter((b) => b['block_definition_id'] === 'builtin.liverecorder');
     expect(recorders).toHaveLength(1);
   });
 
@@ -185,7 +206,7 @@ describe('flow-generator — recorder wiring (#41)', () => {
     const result = await activateStromFlow(production as never, strom as never);
     const flow = strom.capturedFlows[0]!;
     const blocks = flow['blocks'] as Array<Record<string, unknown>>;
-    expect(blocks.find((b) => b['block_definition_id'] === 'builtin.recorder')).toBeUndefined();
+    expect(blocks.find((b) => b['block_definition_id'] === 'builtin.liverecorder')).toBeUndefined();
     expect(result.recorderBlockId).toBeUndefined();
     expect(strom.blocks.list).not.toHaveBeenCalled();
   });
@@ -359,6 +380,98 @@ describe('recording-uploader — SigV4 PutObject + upload-from-local (#41)', () 
     expect(res.uploaded).toHaveLength(1);
     // ...but nothing is deleted while the activation may still be live.
     expect(strom.media.deleteFile).not.toHaveBeenCalled();
+    expect(strom.media.deleteDirectory).not.toHaveBeenCalled();
+  });
+
+  it('aborts the sweep on the first object-store auth failure instead of re-PUTting every segment (#465)', async () => {
+    // Downloads always succeed; the S3 PUT is rejected with a 403 /
+    // InvalidAccessKeyId — a deterministic credential failure that would hit
+    // every remaining segment identically.
+    const fetchMock = vi.fn().mockImplementation((url: string) => {
+      if (url.includes('/api/media/file/')) {
+        return Promise.resolve({ ok: true, arrayBuffer: async () => new TextEncoder().encode('data').buffer });
+      }
+      return Promise.resolve({
+        ok: false,
+        status: 403,
+        text: async () => '<Error><Code>InvalidAccessKeyId</Code></Error>',
+      });
+    });
+    vi.stubGlobal('fetch', fetchMock);
+
+    const strom = makeStromMediaClient([
+      { name: 'seg_00001.mp4', path: 'recordings/prod-rec-1/seg_00001.mp4', is_dir: false, size: 4 },
+      { name: 'seg_00002.mp4', path: 'recordings/prod-rec-1/seg_00002.mp4', is_dir: false, size: 4 },
+      { name: 'seg_00003.mp4', path: 'recordings/prod-rec-1/seg_00003.mp4', is_dir: false, size: 4 },
+    ]);
+
+    const { uploadRecordings } = await import('../lib/recording-uploader.js');
+    const res = await uploadRecordings({
+      strom: strom as never,
+      stromUrl: 'http://localhost:7000',
+      stromToken: 'tok',
+      outputDir: 'recordings/prod-rec-1',
+      productionId: 'prod-rec-1',
+      target,
+      isStillRecording: () => false,
+    });
+
+    // Only the first segment was attempted: one download + one PUT. The other
+    // two segments were never downloaded or re-PUT.
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+    expect(fetchMock.mock.calls.some(([u]) => (u as string).includes('seg_00002'))).toBe(false);
+    expect(fetchMock.mock.calls.some(([u]) => (u as string).includes('seg_00003'))).toBe(false);
+
+    expect(res.uploaded).toHaveLength(0);
+    expect(res.failed).toHaveLength(1);
+    expect(res.failed[0]!.file).toBe('recordings/prod-rec-1/seg_00001.mp4');
+    expect(res.abortedOnAuthError).toEqual({
+      file: 'recordings/prod-rec-1/seg_00001.mp4',
+      code: 'InvalidAccessKeyId',
+    });
+    // Nothing uploaded + failures present → no deletes, folder left for retry.
+    expect(strom.media.deleteFile).not.toHaveBeenCalled();
+    expect(strom.media.deleteDirectory).not.toHaveBeenCalled();
+  });
+
+  it('does not abort the sweep on a single transient per-file failure (#465)', async () => {
+    // The first segment's PUT fails with a transient 500; the rest must still
+    // be attempted (best-effort per-file semantics, not a short-circuit).
+    const fetchMock = vi.fn().mockImplementation((url: string) => {
+      if (url.includes('/api/media/file/')) {
+        return Promise.resolve({ ok: true, arrayBuffer: async () => new TextEncoder().encode('data').buffer });
+      }
+      if (url.includes('seg_00001')) {
+        return Promise.resolve({ ok: false, status: 500, text: async () => 'InternalError' });
+      }
+      return Promise.resolve({ ok: true, text: async () => '' });
+    });
+    vi.stubGlobal('fetch', fetchMock);
+
+    const strom = makeStromMediaClient([
+      { name: 'seg_00001.mp4', path: 'recordings/prod-rec-1/seg_00001.mp4', is_dir: false, size: 4 },
+      { name: 'seg_00002.mp4', path: 'recordings/prod-rec-1/seg_00002.mp4', is_dir: false, size: 4 },
+    ]);
+
+    const { uploadRecordings } = await import('../lib/recording-uploader.js');
+    const res = await uploadRecordings({
+      strom: strom as never,
+      stromUrl: 'http://localhost:7000',
+      stromToken: 'tok',
+      outputDir: 'recordings/prod-rec-1',
+      productionId: 'prod-rec-1',
+      target,
+      isStillRecording: () => false,
+    });
+
+    // The transient failure did not short-circuit: both segments were attempted.
+    expect(res.abortedOnAuthError).toBeUndefined();
+    expect(res.failed.map((f) => f.file)).toEqual(['recordings/prod-rec-1/seg_00001.mp4']);
+    expect(res.uploaded.map((u) => u.key)).toEqual(['prod-rec-1/seg_00002.mp4']);
+    // The one segment that uploaded is deleted; the folder still holds the
+    // failed one, so no directory cleanup.
+    expect(strom.media.deleteFile).toHaveBeenCalledTimes(1);
+    expect(strom.media.deleteFile).toHaveBeenCalledWith('recordings/prod-rec-1/seg_00002.mp4');
     expect(strom.media.deleteDirectory).not.toHaveBeenCalled();
   });
 });

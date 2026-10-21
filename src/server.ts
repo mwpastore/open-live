@@ -33,10 +33,12 @@ import outputsRoutes from './routes/outputs.js';
 import recordingsRoutes from './routes/recordings.js';
 import authRoutes from './routes/auth.js';
 import gatewaysRoutes from './routes/gateways.js';
+import storageConnectionsRoutes from './routes/storage-connections.js';
 import clipsRoutes from './routes/clips.js';
 import guestsRoutes from './routes/guests.js';
 import guestPageRoutes from './routes/guest-page.js';
 import returnsRoutes from './routes/returns.js';
+import usageRoutes from './routes/usage.js';
 import controllerWs from './ws/controller.js';
 import gatewayHeartbeatWs from './ws/gateway-heartbeat.js';
 
@@ -93,9 +95,14 @@ function isGatewayHeartbeatPath(path: string): boolean {
  * are operator/automation surfaces behind the shared key.
  */
 function isGuestTokenAuthedPath(path: string): boolean {
-  // join, session (leave), session/return (guest return-mode switch, #300) and
-  // session/mute (guest mic mute toggle, #382).
-  return /^\/api\/v1\/guests\/[^/]+\/(join|session|session\/return|session\/mute)$/.test(path);
+  // join, slot (read-only: does the slot take WHIP), session (leave),
+  // session/return (guest return-mode switch, #300), session/mute (guest mic
+  // mute toggle, #382), and the guest-scoped WHIP publish + its session
+  // PATCH/DELETE and the return WHEP feeds (picture and fast) + their teardown
+  // (issue #423) — needed because the OSC ingress gate only passes
+  // `^/api/v1/guests` (osaas-app#6143). Each handler verifies the per-invite
+  // token itself (whip.ts / returns.ts), exactly like join/session.
+  return /^\/api\/v1\/guests\/[^/]+\/(join|slot|session|session\/return|session\/mute|whip|returns\/(?:picture|fast)\/whep(?:\/[^/]+)?)$/.test(path);
 }
 
 // Sentinel subprotocols used to carry the API key through the
@@ -219,6 +226,9 @@ export async function buildServer() {
           'token',
           'secret',
           'signingSecret',
+          'encryptionSecret',
+          'secretKey',
+          'secretKeyEnc',
           'address',
           '*.srt_uri',
           '*.passphrase',
@@ -226,6 +236,9 @@ export async function buildServer() {
           '*.token',
           '*.secret',
           '*.signingSecret',
+          '*.encryptionSecret',
+          '*.secretKey',
+          '*.secretKeyEnc',
           '*.address',
           'req.headers.authorization',
           'headers.authorization',
@@ -390,10 +403,18 @@ export async function buildServer() {
       // /api/v1 and would otherwise expose the full API blueprint — route
       // signatures, schemas, and the bearer-auth config — unauthenticated even
       // when API_KEY is set.
+      //
+      // /metrics (issue #500) is a TOP-LEVEL path (the Prometheus convention),
+      // so it must be listed explicitly here too: keeping it out of
+      // AUTH_EXEMPT_PATHS is necessary but NOT sufficient — without this prefix
+      // it would fall through the return below and be served anonymously,
+      // leaking per-tenant GPU usage. It carries no guest-token exemption; the
+      // shared key is the only credential it accepts.
       if (
         !req.url.startsWith('/api/v1') &&
         !req.url.startsWith('/ws/') &&
-        !req.url.startsWith('/documentation')
+        !req.url.startsWith('/documentation') &&
+        !req.url.startsWith('/metrics')
       ) {
         return;
       }
@@ -512,10 +533,12 @@ export async function buildServer() {
   await fastify.register(recordingsRoutes);
   await fastify.register(authRoutes);
   await fastify.register(gatewaysRoutes);
+  await fastify.register(storageConnectionsRoutes);
   await fastify.register(clipsRoutes);
   await fastify.register(guestsRoutes);
   await fastify.register(guestPageRoutes);
   await fastify.register(returnsRoutes);
+  await fastify.register(usageRoutes);
   await fastify.register(controllerWs);
   await fastify.register(gatewayHeartbeatWs);
 

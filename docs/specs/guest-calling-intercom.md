@@ -157,8 +157,9 @@ DELETE /api/v1/productions/:id/guests/invites/:inviteId
 
 ```
 POST   /api/v1/guests/:inviteId/join       (Authorization: Bearer <invite token>)
-  200 → { guestId, whipUrl, feeds, modes, defaultMode, returnMode, intercomLine? }
-      # whipUrl → existing /api/v1/productions/:id/whip/:mixerInput contract
+  200 → { guestId, whipUrl?, returnOnly, feeds, modes, defaultMode, returnMode, intercomLine? }
+      # whipUrl → existing /api/v1/productions/:id/whip/:mixerInput contract;
+      #   absent (returnOnly: true) when the slot's source is not WHIP
       # feeds[].url → per-guest /api/v1/productions/:id/returns/:mixerInput/... routes, not
       #   /api/v1/whep-proxy?target=..., which forwards to any URL on the Strom host and so
       #   cannot be scoped to one guest's token
@@ -167,7 +168,48 @@ POST   /api/v1/guests/:inviteId/join       (Authorization: Bearer <invite token>
 
 DELETE /api/v1/guests/:inviteId/session    (guest leaves)
   204
+
+GET    /api/v1/guests/:inviteId/slot       (Authorization: Bearer <invite token>)
+  200 → { mixerInput, returnOnly }          # read-only; creates no session
 ```
+
+#### Return-only slots
+
+A guest slot whose source is not WHIP (an SRT encoder: a phone on cellular, an
+aid-station camera) is return-only. The guest's picture and voice reach the slot
+from the encoder; the invite gives the guest the return and nothing else.
+
+- **Derived from the slot, not set on the invite.** The minus modes exclude the
+  slot's channel, so they are right only if the guest's voice is on that channel.
+  The slot's source decides where that voice comes from, so it also decides
+  whether the guest publishes. An invite flag could disagree with the slot (a
+  return-only invite on a WHIP slot leaves the slot empty; a publishing invite
+  on an SRT slot has nowhere to publish).
+- **The minus assumes the encoder carries the guest's voice.** The invite names
+  the slot's mixer input, and program-minus closes that input's channel. If the
+  guest speaks on air some other way (a separate mic on another input), the
+  minus removes the encoder's audio instead and the guest hears themselves.
+  Nothing checks this; the operator inviting the right slot is what makes it
+  hold, as for WHIP slots.
+- **No WHIP grant.** Join omits `whipUrl`, and a guest-token WHIP publish on a
+  return-only slot is `403`. The flow builds no WHIP endpoint for the input, so
+  this is defence in depth.
+- **No device prompt.** The guest page reads `GET …/slot` before asking for a
+  camera or microphone, and skips both on a return-only slot. Any other result,
+  including a failed check or a dead invite, opens the camera as for a WHIP
+  slot, and join reports a dead invite as before. Join has the final
+  say: the page publishes only when join returns a `whipUrl`, opening the
+  camera then if it has not, and releases the camera when join returns none.
+- **Changing a slot's source mid-show.** The WHIP grant follows the slot's
+  current source, while the running flow keeps the inputs it was activated
+  with. A WHIP guest whose slot is switched to another source during the show
+  cannot republish (a reconnect is `403`) until the production is reactivated.
+- **Encoder setup stays with the operator.** The page does not show the SRT
+  address. An SRT address carries the source's long-lived passphrase; the
+  invite token is short-lived and revocable per invite. Showing one to every
+  invite holder would let a leaked or expired invite outlive its revocation.
+- **Leave and kick end the guest session, not the encoder.** The SRT stream is
+  the operator's; it keeps feeding the slot until the operator stops it.
 
 ### Guest management (operator / automation)
 
@@ -193,7 +235,7 @@ POST/DELETE /api/v1/productions/:id/returns/:mixerInput/picture/whep
 POST/DELETE /api/v1/productions/:id/returns/:mixerInput/fast/whep   # lowLatency only (after v1)
 PUT         /api/v1/productions/:id/returns/:mixerInput/mode        # crew; body { mode }
 GET         /api/v1/productions/:id/returns/:mixerInput             # crew; join shape, no guest fields
-PUT         /api/v1/guests/:inviteId/session/return                 # guest token; body { mode }
+GET/PUT     /api/v1/guests/:inviteId/session/return                 # guest token; PUT body { mode }
 ```
 
 Return fields in the join response:
@@ -215,7 +257,16 @@ returnMode: 'program' | 'program-minus';   // current mode of the picture feed's
   return is an error rather than a guest hearing themselves.
 - **Mode changes** — `PUT …/mode`, the guest route and `RETURN_SET` share one handler: persist,
   apply live if active, broadcast `RETURN_STATE`. Only `program` and `program-minus`;
-  `low-latency-minus` is a client-side feed choice and returns `400`.
+  `low-latency-minus` is a client-side feed choice and returns `400`. The guest routes need the
+  invite's live session and act on its `mixerInput`, so a guest who has left cannot change the
+  return of whoever holds the slot now. Guest and crew changes are last-write-wins; the guest
+  page polls `GET …/session/return` (every 5 s) to follow a crew change, since guests have no
+  WebSocket. Three 401s in a row (a single one can be a
+  momentary database error) stop the poll and hide the switch; a PUT with no answer after 10 s is
+  abandoned and the previous mode shown until the next poll.
+- **Guest page switch** — once live, the page offers the two picture-switch modes ("Program
+  without you" and "Full program"). With `program` on and the mic open it warns that the
+  guest hears their own voice about half a second late.
 - **Scoping** — the Strom target is derived server-side, as the WHIP proxy does
   (`src/routes/whip.ts:30-35`), and session URLs are checked against that output's endpoint path,
   not just the Strom origin. Credentials in `Authorization` only. A guest token is scoped to its

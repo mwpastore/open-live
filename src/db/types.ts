@@ -60,6 +60,14 @@ export interface ClipReferenceS3 {
   bucket: string;
   key: string;
   timerange?: string;
+  /**
+   * Optional id of the {@link StorageConnectionDoc} whose endpoint/region/
+   * credentials presign this object (issue #520, OL-21). Absent = the implicit
+   * default connection built from the `MINIO_*` / `S3_ENDPOINT` env — exactly
+   * today's behaviour. A `connectionId` that no longer resolves is a Cue-time
+   * error, the same place a bad bucket surfaces today.
+   */
+  connectionId?: string;
 }
 
 /** BBC Time-Addressable Media Store (flow + timerange). Reserved — not v1. */
@@ -170,6 +178,11 @@ export interface SourceDoc {
   liveCamera?: boolean;
   /** SRT receiver buffer latency in ms. Only applies to srt/efp stream types. Default 125. */
   latency?: number;
+  /**
+   * 0-based audio elementary-stream index an SRT/EFP input uses (ADR-006).
+   * Additive, no migration: absent => 0. Only valid for srt/efp stream types.
+   */
+  audioStreamIndex?: number;
   /**
    * Authenticated-HTML-source auth material (issue #314). Present only for
    * `streamType: 'html'`. Additive and defaulted-absent — every existing source
@@ -320,6 +333,13 @@ export interface OutputDoc {
    */
   rtmp?: RtmpDestination;
   /**
+   * Optional id of the {@link StorageConnectionDoc} a `recording` output writes
+   * its segments to (issue #520, OL-21). Present only on `recording` outputs;
+   * absent = the implicit default connection built from the env, exactly as
+   * today. Stamped onto each {@link RecordingDoc} written by this output.
+   */
+  connectionId?: string;
+  /**
    * Derived output health (issue #255). Optional; when absent, read as
    * `unknown`. Computed on read from the owning production's live flow state
    * rather than persisted (see `src/lib/production-health.ts`).
@@ -351,14 +371,78 @@ export interface RecordingDoc {
   type: 'recording';
   productionId: string;   // references ProductionDoc._id
   outputId?: string;      // the 'recording' OutputDoc that produced it, when known
+  /**
+   * Id of the {@link StorageConnectionDoc} this asset was written to (issue
+   * #520, OL-21). Absent = the implicit default (env) connection — no backfill
+   * runs on existing recordings, and "absent" and `"default"` resolve
+   * identically for playback presigning (spec §3.3).
+   */
+  connectionId?: string;
+  mixerInput?: string;    // the input it records (ProductionSourceAssignment.record); absent for the program recording
+  track?: 'video' | 'audio'; // which of that input's tracks; each is recorded to its own file
   bucket: string;
   key: string;            // object key, e.g. "<productionId>/<segment>.mp4"
   sizeBytes?: number;
+  /** Media duration read from the MP4 movie header at upload (issue #534); absent when unreadable. */
   durationMs?: number;
   startedAt: string;      // ISO 8601 — when the recording session began, from the segment's file name
   endedAt?: string;       // ISO 8601 — when the segment was finalized/uploaded
   createdAt: string;
   updatedAt: string;
+}
+
+/**
+ * The recording output a production's recorder block was wired for, captured
+ * at activation (issue #534).
+ */
+export interface ActiveRecording {
+  /** The `recording` OutputDoc wired into the recorder block. */
+  outputId: string;
+  /** That output's storage connection at activation; absent = the default (env) connection. */
+  connectionId?: string;
+  /** ISO 8601 — when the activation that built the recorder block started. */
+  startedAt: string;
+}
+
+/**
+ * Why a deactivate's recording upload uploaded nothing or stopped early (issue #534):
+ *  - `no-storage-target`: no connection on the output and the `MINIO_*` env is incomplete;
+ *  - `connection-not-found`: the output's storage connection no longer exists;
+ *  - `connection-no-bucket`: the connection has no default bucket to write to;
+ *  - `auth-error`: the store rejected the credentials or permission (sweep aborted);
+ *  - `upload-error`: listing the recordings on Strom or the upload pass itself failed.
+ */
+export type RecordingUploadReason =
+  | 'no-storage-target'
+  | 'connection-not-found'
+  | 'connection-no-bucket'
+  | 'auth-error'
+  | 'upload-error';
+
+/** Summary of a deactivate's recording upload, stored on the production (issue #534). */
+export interface RecordingUploadSummary {
+  /** ISO 8601 — when the upload step finished. */
+  finishedAt: string;
+  /** The recording output the upload was for, when known. */
+  outputId?: string;
+  /** Storage connection used; absent = the default (env) connection. */
+  connectionId?: string;
+  /** Bucket written to, when a target was resolved. */
+  bucket?: string;
+  /** Number of files uploaded (and listed as recordings). */
+  uploaded: number;
+  /**
+   * Files that failed to upload; they stay on Strom for the next sweep.
+   * `error` includes up to the first 200 characters of the S3 error body. It
+   * never holds the secret key or a presigned URL (PUT uses header auth). For
+   * some codes S3 echoes `<AWSAccessKeyId>`/`<StringToSign>` later in the body;
+   * the 200-character cut normally drops those.
+   */
+  failed: Array<{ file: string; error: string }>;
+  /** Set when nothing was attempted or the sweep stopped early. */
+  reason?: RecordingUploadReason;
+  /** Human-readable explanation accompanying `reason`. */
+  message?: string;
 }
 
 // --------------- Guest calling types (issue #299, epic #208) ---------------
@@ -412,7 +496,17 @@ export interface GuestSessionDoc {
    * A rejoin resets it to unmuted.
    */
   muted?: boolean;
-  whipSessionId?: string;
+  /**
+   * Absolute Strom WHIP **session-resource** URL for this guest's live publish
+   * (`/whip/{endpoint_id}/resource/{resource_id}`), captured from the `Location`
+   * header Strom returns on the WHIP offer POST (`proxyWhipOffer`, issue #467).
+   * Server-side teardown (`teardownGuestWhip` on leave/kick) DELETEs THIS URL —
+   * a DELETE on the bare endpoint URL does not end the session, so without this
+   * Strom kept the guest session until its 10 s inactivity reaper. Absent on a
+   * return-only slot or before the guest has published; stale after a reconnect
+   * until the next offer overwrites it. Internal — stripped from `sessionToApi`.
+   */
+  whipSessionUrl?: string;
   /**
    * Strom WHEP session id of this guest's most recent return-picture feed
    * (issue #380). Bound on `POST .../returns/:mixerInput/picture/whep` so the
@@ -448,6 +542,178 @@ export interface GuestSigningKeyDoc {
   createdAt: string;        // ISO 8601
 }
 
+/**
+ * The backend-generated AES-256 credential encryption key (issue #438).
+ *
+ * On OSC no `SRT_PASSPHRASE_KEY` / `HTML_AUTH_KEY` is provisioned, so saving an
+ * SRT passphrase or an authenticated-HTML-source credential failed closed with a
+ * 503 (`Credential storage is not configured`). Mirroring the guest-invite
+ * signing key (#391), the backend now generates this key on first start and
+ * stores it under a SINGLE FIXED id (`CREDENTIAL_ENCRYPTION_KEY_DOC_ID`), reading
+ * it back on every subsequent start so restarts still decrypt existing
+ * credentials. It is the fallback key for the SRT passphrase crypto and the
+ * HTML-auth crypto; `SRT_PASSPHRASE_KEY` / `HTML_AUTH_KEY` (env) still override it
+ * when set, so self-hosted deployments are unchanged. RTMP stream keys keep their
+ * dedicated `RTMP_CREDENTIALS_KEY` and NEVER fall back here (ADR-004 Decision 2).
+ *
+ * `encryptionSecret` is a credential: it is NEVER logged (the `secret` substring
+ * is matched by `src/lib/log-redact.ts` and the Fastify logger redact paths in
+ * `src/server.ts`) and NEVER returned by any route.
+ */
+export interface CredentialEncryptionKeyDoc {
+  _id: string;              // fixed: "credential-encryption-key"
+  _rev?: string;
+  type: 'credential-encryption-key';
+  /** Randomly generated 32-byte AES-256 key (base64). Never logged or returned. */
+  encryptionSecret: string;
+  createdAt: string;        // ISO 8601
+}
+
+/**
+ * The backend-generated AES-256 RTMP stream-key encryption key (issue #447).
+ *
+ * This is the RTMP analogue of `CredentialEncryptionKeyDoc` (#438/#446), kept
+ * DELIBERATELY SEPARATE: ADR-004 Resolved Decision 2 requires a dedicated
+ * `RTMP_CREDENTIALS_KEY` with NO reuse of / fallback to the SRT/credential key,
+ * so RTMP stream-key rotation stays isolated from SRT-passphrase / HTML-auth key
+ * rotation. On OSC `RTMP_CREDENTIALS_KEY` is never provisioned, so saving an RTMP
+ * stream key previously failed closed with a 503 and RTMP publishing was
+ * unavailable on every OSC instance.
+ *
+ * Mirroring `CredentialEncryptionKeyDoc`, the backend now generates this key on
+ * first start and stores it under its OWN single fixed id
+ * (`RTMP_CREDENTIAL_KEY_DOC_ID`, distinct from
+ * `CREDENTIAL_ENCRYPTION_KEY_DOC_ID`), reading it back on every subsequent start
+ * so restarts still decrypt existing RTMP stream keys. It is the fallback key for
+ * the RTMP stream-key crypto ONLY (`src/lib/rtmp-credentials-crypto.ts`);
+ * `RTMP_CREDENTIALS_KEY` (env) still overrides it when set, so self-hosted
+ * deployments are unchanged.
+ *
+ * `encryptionSecret` is a credential: it is NEVER logged (the `secret` substring
+ * is matched by `src/lib/log-redact.ts` and the Fastify logger redact paths in
+ * `src/server.ts`) and NEVER returned by any route.
+ */
+export interface RtmpCredentialKeyDoc {
+  _id: string;              // fixed: "rtmp-credentials-key"
+  _rev?: string;
+  type: 'rtmp-credentials-key';
+  /** Randomly generated 32-byte AES-256 key (base64). Never logged or returned. */
+  encryptionSecret: string;
+  createdAt: string;        // ISO 8601
+}
+
+// --------------- Storage connections (issue #520, OL-21) ---------------
+
+/** Advisory least-privilege tag; NOT enforced by the backend in v1 (spec §2.1). */
+export type StorageConnectionRole = 'clip' | 'recording' | 'both';
+
+/**
+ * A named, operator-managed object-storage connection (issue #520, OL-21,
+ * `docs/specs/storage-connections.md`, ADR-009). Clip sources and recording
+ * targets each OPTIONALLY choose a connection; absent means the implicit default
+ * connection built from the `MINIO_*` / `S3_ENDPOINT` env, so existing
+ * instances, `s3` references, and recordings keep working unchanged.
+ *
+ * A `StorageConnectionDoc` maps 1:1 onto a `MinioTarget`
+ * (`src/lib/recording-uploader.ts`) once `secretKeyEnc` is decrypted and a bucket
+ * is supplied, so the existing presign / putObject / list code paths are reused
+ * with a per-connection target instead of `minioTargetFromConfig()`.
+ *
+ * The reserved id `"default"` is NEVER a stored document — it denotes the
+ * env-derived connection, materialised on demand from `minioTargetFromConfig()`.
+ *
+ * `secretKeyEnc` is a credential: it is encrypted at rest (`encv1:` AES-256-GCM,
+ * `src/lib/storage-connection-crypto.ts`), NEVER returned by any route (the API
+ * exposes only `secretKeySet: boolean`), and NEVER logged (`secret` substring
+ * redaction in `src/lib/log-redact.ts` and the Fastify logger redact paths).
+ */
+export interface StorageConnectionDoc {
+  _id: string;              // "stconn-<uuid>"
+  _rev?: string;
+  type: 'storage-connection';
+  name: string;
+  endpoint: string;         // host[:port], scheme stripped (as MinioTarget.endpoint)
+  useSsl: boolean;
+  region: string;
+  accessKey: string;        // access key id — not secret, stored/returned in clear
+  secretKeyEnc: string;     // "encv1:<base64url(iv|tag|ciphertext)>" — NEVER plaintext, NEVER returned
+  defaultBucket?: string;
+  role: StorageConnectionRole;
+  createdAt: string;        // ISO 8601
+  updatedAt: string;        // ISO 8601
+}
+
+// --------------- Shared-GPU usage ledger (issue #500) ---------------
+
+/**
+ * A surviving snapshot of a deleted production's settled shared-GPU buckets
+ * (issue #500).
+ *
+ * `gpuHours` normally lives ONLY on the owning `ProductionDoc`, so destroying a
+ * production — a normal path, e.g. deleting it right after a show — would
+ * permanently lose every retained closed-hour bucket AND the final partial hour,
+ * making those billable hours unrecoverable. Before the production doc is
+ * destroyed (`DELETE /api/v1/productions/:id`), its final partial hour is settled
+ * (`settleOnStop`) and the resulting buckets are copied here as a ledger record
+ * that OUTLIVES the production. The usage read path folds these records back in,
+ * keyed by the SAME `production-<id>` resource, so `/api/v1/usage/gpu` and
+ * `/metrics` keep reporting them until their buckets age past
+ * `GPU_USAGE_RETENTION_HOURS` (pruned on read exactly like `ProductionDoc.gpuHours`).
+ *
+ * Kept under a deterministic id (`gpu-ledger-<productionId>`) so a re-delete (or a
+ * delete after a settle wrote more buckets) upserts the same record rather than
+ * duplicating it.
+ */
+export interface GpuUsageLedgerDoc {
+  _id: string;              // "gpu-ledger-<productionId>"
+  _rev?: string;
+  type: 'gpu-usage-ledger';
+  /** The deleted production's id — the usage read reuses its stable resource id. */
+  productionId: string;
+  /** Settled closed + final-partial UTC-hour buckets inherited from the production. */
+  gpuHours: Record<string, number>;
+  createdAt: string;        // ISO 8601
+  updatedAt: string;        // ISO 8601
+}
+
+// --------------- Shared-GPU metering enablement marker ---------------
+
+/**
+ * Instance-wide record of when shared-GPU metering was first enabled on this
+ * instance (issue #535, part of #526). Written once by `startGpuUsageSweep` under
+ * a fixed id and never overwritten on later restarts. GPU accrual starts at
+ * `max(activatedAt, enabledAt)`, so a production that was already live when
+ * metering was switched on is never back-charged for the time before the switch.
+ */
+export interface GpuMeteringStateDoc {
+  _id: string;              // fixed: "gpu-metering-state"
+  _rev?: string;
+  type: 'gpu-metering-state';
+  /** First time metering was enabled on this instance — the accrual floor. */
+  enabledAt: string;        // ISO 8601
+}
+
+// --------------- One-time data migration marker ---------------
+
+/**
+ * Marker for a completed one-time, instance-wide data migration. Each migration
+ * has a fixed id (e.g. `audio-channel-order-v2`); the presence of its doc means
+ * the migration has already run on this instance, so a later restart skips it.
+ * Kept as a singleton-per-migration doc (mirroring the stored-key docs) rather
+ * than a per-production flag so productions created AFTER the migration — which
+ * are already in the new shape — are never re-migrated and corrupted.
+ */
+export interface MigrationStateDoc {
+  _id: string;              // fixed per migration, e.g. "migration:audio-channel-order-v2"
+  _rev?: string;
+  type: 'migration-state';
+  /** Stable migration identifier (same as the `_id` suffix). */
+  migration: string;
+  /** How many documents the migration actually changed (diagnostics only). */
+  migratedCount: number;
+  completedAt: string;      // ISO 8601
+}
+
 // --------------- Production config types ---------------
 
 export interface ProductionConfigDoc {
@@ -461,6 +727,19 @@ export interface ProductionConfigDoc {
 }
 
 // --------------- Production types ---------------
+
+/**
+ * How a source assignment's input is recorded on its own (docs/recording-inputs.md).
+ * - `off`: not recorded (the default).
+ * - `transcode`: decoded picture and sound → builtin.videoenc / builtin.audioenc → recorder.
+ *   The mode for browser WHIP feeds: their H.264 has irregular keyframes, and a
+ *   keyframe request cannot reach the browser from the recorder's side of
+ *   Strom's WHIP session bridge.
+ * - `passthrough`: the encoded streams straight into the recorder, for SRT/EFP
+ *   feeds from encoders with a fixed GOP. Not built yet: the API rejects it,
+ *   and activation skips an assignment that still carries it, with a warning.
+ */
+export type InputRecordMode = 'off' | 'transcode' | 'passthrough';
 
 /**
  * Maps a source from the sources catalogue to a mixer input in the template.
@@ -478,6 +757,12 @@ export interface ProductionSourceAssignment {
    * (`src/lib/fast-returns.ts`), ahead of the picture by design.
    */
   returnFeed?: { synced: 'program' | 'program-minus'; lowLatency?: boolean };
+  /**
+   * Whether this input is recorded on its own, beside the program recording.
+   * Off unless set: the feed may already be recorded upstream, and in a
+   * delayed production the mixer inputs are bridged out of the store.
+   */
+  record?: InputRecordMode;
 }
 
 /**
@@ -527,6 +812,40 @@ export type ProductionStatus = 'active' | 'inactive' | 'activating' | 'ended';
 /** Machine-readable reason a production reached `ended` (issue #255, optional). */
 export type EndedReason = 'deactivated' | 'idle' | 'flow-lost';
 
+/**
+ * Why a source's selected audio stream (`SourceDoc.audioStreamIndex`) was not
+ * applied at activation (spec docs/specs/audio-stream-selection.md §5.4,
+ * ADR-010 Decision 4). The input is always built on the first stream instead.
+ */
+export type AudioStreamNotAppliedReason =
+  | 'stream-type-unsupported'
+  | 'strom-capability-missing'
+  | 'stream-not-present';
+
+/**
+ * A problem found while going on air that did not stop activation. Persisted as
+ * `ProductionDoc.activationWarnings`, returned on the production resource and
+ * replayed as WS `ERROR` frames on controller connect (spec §2.5).
+ */
+export type ActivationWarning =
+  | { type: 'recording-no-audio'; message: string }
+  | { type: 'recording-unavailable'; message: string }
+  | { type: 'input-recording-incomplete'; message: string }
+  | {
+      type: 'audio-stream-not-applied';
+      /** SourceDoc._id */
+      sourceId: string;
+      /** Stored assignment key (e.g. 'video_in_3'), not the compacted Strom pad. */
+      mixerInput: string;
+      /** Effective SourceDoc.audioStreamIndex (> 0), 0-based. */
+      requestedIndex: number;
+      /** v1 always clamps to the first stream. */
+      appliedIndex: 0;
+      reason: AudioStreamNotAppliedReason;
+      /** Human text (1-based stream numbers), also used for the WS ERROR toast. */
+      message: string;
+    };
+
 export interface ProductionDoc {
   _id: string;
   _rev?: string;
@@ -550,10 +869,27 @@ export interface ProductionDoc {
   pipConfigs?: PipConfig[];
   /** ID of the running Strom flow (set on activate, cleared on deactivate) */
   stromFlowId?: string;
-  /** ID of the builtin.recorder block — set on activate when a 'recording' output is assigned, cleared on deactivate */
+  /** ID of the builtin.liverecorder block — set on activate when a 'recording' output is assigned, cleared on deactivate */
   recorderBlockId?: string;
+  /**
+   * Upload target of the running recording, snapshotted at activation next to
+   * {@link recorderBlockId} (issue #534). Deactivate uploads to this target
+   * instead of re-reading the production's current output assignments, so
+   * removing or re-pointing the recording output on a live production cannot
+   * change where the running recording goes or drop its upload. Cleared on
+   * deactivate.
+   */
+  recording?: ActiveRecording;
+  /**
+   * Outcome of the most recent deactivate that had a recording to upload (issue
+   * #534). Kept until the next such deactivate replaces it. Never holds secrets
+   * or presigned URLs.
+   */
+  lastRecordingUpload?: RecordingUploadSummary;
   /** Strom media directory this activation's recorder writes into — set on activate alongside recorderBlockId, cleared on deactivate */
   recorderOutputDir?: string;
+  /** Maps mixerInput → builtin.liverecorder block ID per track of that input's own recording (ProductionSourceAssignment.record) — set on activate, cleared on deactivate */
+  inputRecorderBlockIds?: Record<string, { video?: string; audio?: string }>;
   /** WHEP multiview endpoint URL — set when flow reaches 'playing' state, cleared on deactivate */
   whepEndpoint?: string;
   /** WHEP PGM output endpoint URL — set when flow reaches 'playing' state, cleared on deactivate */
@@ -564,6 +900,17 @@ export interface ProductionDoc {
   srtOutputUri?: string;
   /** Template property values chosen at production creation, keyed by property id */
   values?: Record<string, string | number | boolean>;
+  /**
+   * Per-production stamp for the issue #487 audio-channel-order migration. Set in
+   * the SAME write that renumbers this doc's `ch{N}_aux{M}_pre` keys, so a
+   * partial-failure retry of the one-time migration skips already-migrated docs
+   * and never double-applies the (bijective) channel remap — which would corrupt
+   * operator pre/post routing. Absent on docs the migration has not touched (and
+   * on productions created after the migration, which are already numbered
+   * correctly and are never scanned, being created after the instance marker).
+   * See `services/migrate-audio-channel-order.ts`.
+   */
+  audioChannelOrderV2?: boolean;
   /** Scheduled on-air start time — ISO 8601 UTC string (e.g. "2026-05-01T18:30:00.000Z") */
   airTime?: string;
   pipeline: Pipeline;
@@ -572,6 +919,17 @@ export interface ProductionDoc {
   tally: Tally;
   mixerBlockId?: string;
   audioMixerBlockId?: string;
+  /**
+   * Persisted audio processing state (issue #527, OL-25) — per-channel gain,
+   * HPF, gate, compressor, EQ and the main-bus compressor, EQ and limiter.
+   * Keyed by elementId ('ch1' | 'main'), then by stage; only stages an operator
+   * has actually set are present. Set via the WS `AUDIO_PROC_SET` handler and
+   * the REST processing route; survives deactivate/reactivate and is re-applied
+   * through the flow generator at build time (including the construction-time
+   * `chN_hpf_enabled`). DELIBERATELY NOT cleared on deactivate and NOT touched
+   * by the connect-time mixer reset. See {@link AudioProcessingStore}.
+   */
+  audioProcessing?: import('../lib/audio-processing.js').AudioProcessingStore;
   /** ID of the builtin.loudness block on the main audio bus — set on activate, cleared on deactivate */
   loudnessMainBlockId?: string;
   /** Maps mixerInput (e.g. 'video_in_1') → time_offset block ID — set on activate, cleared on deactivate */
@@ -580,6 +938,17 @@ export interface ProductionDoc {
   sourceAudioOffsetBlockIds?: Record<string, string>;
   /** Maps mixerInput → media-player (builtin.media_player) block ID for clip sources — set on activate, cleared on deactivate */
   clipPlayerBlockIds?: Record<string, string>;
+  /**
+   * Maps a stored `mixerInput` (e.g. 'video_in_15') to the COMPACT vision-mixer
+   * pad index actually wired in the live Strom flow (issue #463) — set on
+   * activate, cleared on deactivate. Studio allocates guest slots from the top of
+   * the mixer-input range down, so the mixer is sized to what the production uses
+   * and the sparse stored pads are compacted to 0..N-1. The stored `mixerInput`
+   * stays the external identity; the WS layer applies this map only at the Strom
+   * boundary (switch/PiP/effect) and inverts it for Strom state read-backs.
+   * Absent / identity for contiguous-from-0 productions.
+   */
+  mixerInputMap?: Record<string, number>;
   /**
    * Persisted clip cue points (epic #206, issue #307 / OQ3). Maps a clip source's
    * mixerInput to the currently-cued clip and its cue position. A cued clip
@@ -622,7 +991,7 @@ export interface ProductionDoc {
    * Problems found while going on air that did not stop activation, such as a
    * recording that will have no sound. Cleared on next activation.
    */
-  activationWarnings?: Array<{ type: 'recording-no-audio'; message: string }>;
+  activationWarnings?: ActivationWarning[];
   /** Set when the idle watchdog auto-deactivated this production; cleared on next activation */
   autoDeactivated?: boolean;
   /**
@@ -632,6 +1001,35 @@ export interface ProductionDoc {
    * status value. Cleared on next activation.
    */
   endedReason?: EndedReason;
+  /**
+   * Shared-GPU usage accrual (issue #500, `docs/specs/shared-gpu-usage-metering.md`,
+   * ADR-005). Both fields are additive, optional and defaulted-absent — existing
+   * docs read as "never accrued", so there is no migration.
+   *
+   * `activatedAt` is the **recorded start** of the current GPU allocation: the
+   * ISO 8601 UTC time the production's Strom flow reached `playing`. It is set in
+   * the SAME write that sets `status: 'active'` (`routes/productions.ts`) and
+   * cleared on every stop path (deactivate, idle auto-deactivate, activation
+   * failure, reconcile losing the flow). A production found still live after a
+   * restart keeps its `activatedAt`, so accrual resumes from the recorded start,
+   * not from zero.
+   *
+   * These are INTERNAL accrual state: they are projected only via
+   * `/api/v1/usage/gpu` and `/metrics`, and are stripped from the production
+   * GET/list/PATCH responses (`toProductionView`) so they never bloat or confuse
+   * existing clients (repo-patterns.md §"toApi() spreads the whole doc").
+   */
+  activatedAt?: string;
+  /**
+   * Closed, settled GPU-second buckets for this production, keyed by UTC hour
+   * `"YYYY-MM-DDTHH:00:00Z"`. Append-only and immutable once written: the settle
+   * sweep writes a key exactly once, when its hour has fully elapsed (and every
+   * stop path settles the final partial hour). The current partial hour of a
+   * live production is NEVER stored here — it is derived on read from
+   * `activatedAt` — so there are no read-modify-write races on a live counter.
+   * Pruned to `GPU_USAGE_RETENTION_HOURS` on settle. See {@link activatedAt}.
+   */
+  gpuHours?: Record<string, number>;
   createdAt: string;
   updatedAt: string;
 }

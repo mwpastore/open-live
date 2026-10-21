@@ -104,6 +104,7 @@ afterAll(() => stromServer.close());
 // real fetch untouched.
 // ---------------------------------------------------------------------------
 const CLIP_URL = 'https://media.example.com/story-a.mp4';
+const CLIP_URL_B = 'https://media.example.com/story-b.mp4';
 // s3-reference presigned URLs resolve against this host (see MINIO_* env below).
 const S3_HOST = 's3.example.test';
 // A public-looking URL whose preflight answers a 302 (Location = redirectLocation),
@@ -129,7 +130,7 @@ vi.spyOn(globalThis, 'fetch').mockImplementation(((input: RequestInfo | URL, ini
   if (url === REDIRECT_URL && redirectLocation) {
     return Promise.resolve(new Response(null, { status: 302, headers: { location: redirectLocation } }));
   }
-  if (url === CLIP_URL) return Promise.resolve(new Response(null, { status: clipUrlStatus }));
+  if (url === CLIP_URL || url === CLIP_URL_B) return Promise.resolve(new Response(null, { status: clipUrlStatus }));
   if (host === S3_HOST) return Promise.resolve(new Response(null, { status: s3Status }));
   return realFetch(input as never, init);
 }) as typeof fetch);
@@ -196,6 +197,10 @@ function send(msg: Record<string, unknown>) {
 }
 function clipStates() {
   return broadcasts.filter((m) => m.type === 'CLIP_STATE');
+}
+function sentFrames() {
+  return (ws.send as unknown as ReturnType<typeof vi.fn>).mock.calls
+    .map((c: unknown[]) => JSON.parse(c[0] as string) as Record<string, unknown>);
 }
 function errorFrames() {
   return (ws.send as unknown as ReturnType<typeof vi.fn>).mock.calls
@@ -302,6 +307,117 @@ describe('CLIP_CUE / PLAY / PAUSE / STOP transitions', () => {
     await send({ type: 'CLIP_CUE', mixerInput: 'video_in_0' });
     expect(errorFrames().length).toBeGreaterThan(0);
     expect(playerReqs('playlist')).toHaveLength(0);
+  });
+});
+
+describe('CLIP_CUE by clip source (OL-19)', () => {
+  const CLIP_B = CLIP_URL_B;
+  beforeEach(() => {
+    sourceDocs.set('src-clip-b', makeSourceDoc({ _id: 'src-clip-b', address: JSON.stringify({ type: 'url', url: CLIP_B }) }));
+  });
+
+  it('loads the source named by clipId and persists it', async () => {
+    playerState = { state: 'paused', duration_ns: 12_000_000_000, position_ns: 0 };
+    await send({ type: 'CLIP_CUE', mixerInput: 'video_in_0', clipId: 'src-clip-b' });
+    expect(errorFrames()).toHaveLength(0);
+    expect(playerReqs('playlist')[0].body).toEqual({ files: [CLIP_B] });
+    expect(clipStates().at(-1)).toMatchObject({ state: 'cued', clipId: 'src-clip-b' });
+    expect(updateProductionDoc).toHaveBeenCalledWith(PROD, expect.objectContaining({ clipCues: expect.objectContaining({ video_in_0: expect.objectContaining({ clipId: 'src-clip-b' }) }) }));
+  });
+
+  it('ERRORs on an unknown source and a non-clip source', async () => {
+    await send({ type: 'CLIP_CUE', mixerInput: 'video_in_0', clipId: 'nope' });
+    sourceDocs.set('src-srt', makeSourceDoc({ _id: 'src-srt', streamType: 'srt', address: 'srt://1.2.3.4:9000' }));
+    await send({ type: 'CLIP_CUE', mixerInput: 'video_in_0', clipId: 'src-srt' });
+    expect(errorFrames()).toHaveLength(2);
+    expect(playerReqs('playlist')).toHaveLength(0);
+  });
+
+  it('NACKs a cue-by-clipId while playing and leaves the tracked state intact', async () => {
+    playerState = { state: 'paused', duration_ns: 12_000_000_000, position_ns: 0 };
+    await send({ type: 'CLIP_CUE', mixerInput: 'video_in_0' });
+    playerState = { state: 'playing', duration_ns: 12_000_000_000, position_ns: 1_000_000_000 };
+    await send({ type: 'CLIP_PLAY', mixerInput: 'video_in_0' });
+    stromRequests.length = 0;
+    broadcasts.length = 0;
+    await send({ type: 'CLIP_CUE', mixerInput: 'video_in_0', clipId: 'src-clip-b', cmdId: 'c-guard' });
+    expect(sentFrames().find((m) => m.type === 'NACK' && m.cmdId === 'c-guard')).toBeDefined();
+    expect(playerReqs('playlist')).toHaveLength(0);
+    expect(clipStates()).toHaveLength(0);
+  });
+
+  it('NACKs a plain cue (no clipId) while playing and leaves the tracked state intact (#504 pt 3)', async () => {
+    playerState = { state: 'paused', duration_ns: 12_000_000_000, position_ns: 0 };
+    await send({ type: 'CLIP_CUE', mixerInput: 'video_in_0' });
+    playerState = { state: 'playing', duration_ns: 12_000_000_000, position_ns: 1_000_000_000 };
+    await send({ type: 'CLIP_PLAY', mixerInput: 'video_in_0' });
+    stromRequests.length = 0;
+    broadcasts.length = 0;
+    await send({ type: 'CLIP_CUE', mixerInput: 'video_in_0', cmdId: 'c-guard-plain' });
+    expect(sentFrames().find((m) => m.type === 'NACK' && m.cmdId === 'c-guard-plain')).toBeDefined();
+    expect(playerReqs('playlist')).toHaveLength(0);
+    expect(clipStates()).toHaveLength(0);
+  });
+
+  it('without clipId loads the assigned source (unchanged)', async () => {
+    playerState = { state: 'paused', duration_ns: 12_000_000_000, position_ns: 0 };
+    await send({ type: 'CLIP_CUE', mixerInput: 'video_in_0' });
+    expect(playerReqs('playlist')[0].body).toEqual({ files: [CLIP_URL] });
+    expect(clipStates().at(-1)).toMatchObject({ clipId: 'src-clip' });
+  });
+});
+
+describe('CLIP_* ACK / NACK with cmdId (issue #499)', () => {
+  function ackFrames(cmdId: string) {
+    return sentFrames().filter((m) => (m.type === 'ACK' || m.type === 'NACK') && m.cmdId === cmdId);
+  }
+
+  it('cue, play, pause, seek, stop each yield accepted then executed in order', async () => {
+    const steps: Array<[Record<string, unknown>, Record<string, unknown>]> = [
+      [{ type: 'CLIP_CUE', mixerInput: 'video_in_0' }, { state: 'paused', duration_ns: 12_000_000_000, position_ns: 0 }],
+      [{ type: 'CLIP_PLAY', mixerInput: 'video_in_0' }, { state: 'playing', position_ns: 20_000_000, duration_ns: 12_000_000_000 }],
+      [{ type: 'CLIP_PAUSE', mixerInput: 'video_in_0' }, { state: 'paused', position_ns: 500_000_000, duration_ns: 12_000_000_000 }],
+      [{ type: 'CLIP_SEEK', mixerInput: 'video_in_0', positionMs: 5000 }, { state: 'paused', position_ns: 5_000_000_000, duration_ns: 12_000_000_000 }],
+      [{ type: 'CLIP_STOP', mixerInput: 'video_in_0' }, { state: 'stopped', position_ns: 0 }],
+    ];
+    let i = 0;
+    for (const [msg, state] of steps) {
+      const cmdId = `clip-${i++}`;
+      playerState = state;
+      await send({ ...msg, cmdId });
+      const frames = ackFrames(cmdId);
+      expect(frames.map((f) => [f.type, f.phase])).toEqual([['ACK', 'accepted'], ['ACK', 'executed']]);
+      expect(frames.every((f) => typeof f.seq === 'number' && typeof f.ts === 'string')).toBe(true);
+    }
+    expect(errorFrames()).toHaveLength(0);
+  });
+
+  it('CLIP_PLAY with nothing cued yields NACK, no executed and no ERROR; CLIP_STATE error still broadcast', async () => {
+    await send({ type: 'CLIP_PLAY', mixerInput: 'video_in_0', cmdId: 'p1' });
+    const frames = ackFrames('p1');
+    expect(frames.map((f) => f.type === 'ACK' ? f.phase : 'NACK')).toEqual(['accepted', 'NACK']);
+    expect(typeof frames[1].error).toBe('string');
+    expect(errorFrames()).toHaveLength(0);
+    expect(clipStates().at(-1)).toMatchObject({ state: 'error' });
+  });
+
+  it('a Strom error on cue yields NACK', async () => {
+    clipUrlStatus = 404; // preflight failure -> cue rejected
+    await send({ type: 'CLIP_CUE', mixerInput: 'video_in_0', cmdId: 'c1' });
+    const frames = ackFrames('c1');
+    expect(frames.map((f) => f.type === 'ACK' ? f.phase : 'NACK')).toEqual(['accepted', 'NACK']);
+    expect(errorFrames()).toHaveLength(0);
+    expect(clipStates().at(-1)).toMatchObject({ state: 'error' });
+  });
+
+  it('without cmdId a failure still sends ERROR and success sends no ACK/NACK', async () => {
+    await send({ type: 'CLIP_PLAY', mixerInput: 'video_in_0' });
+    expect(errorFrames().length).toBe(1);
+    expect(sentFrames().some((m) => m.type === 'ACK' || m.type === 'NACK')).toBe(false);
+    (ws.send as unknown as ReturnType<typeof vi.fn>).mockClear();
+    playerState = { state: 'paused', duration_ns: 12_000_000_000, position_ns: 0 };
+    await send({ type: 'CLIP_CUE', mixerInput: 'video_in_0' });
+    expect(sentFrames().some((m) => m.type === 'ACK' || m.type === 'NACK' || m.type === 'ERROR')).toBe(false);
   });
 });
 
@@ -435,7 +551,46 @@ describe('clip URL preflight — s3 references (issue #351)', () => {
     await send({ type: 'CLIP_CUE', mixerInput: 'video_in_0' });
 
     expect(errorFrames().length).toBeGreaterThan(0);
-    expect(clipStates().at(-1)).toMatchObject({ state: 'error', error: 'Clip URL returned HTTP 404' });
+    expect(clipStates().at(-1)).toMatchObject({ state: 'error', error: 'Clip URL returned HTTP 404 (bucket "clips", key "story/a.mp4")' });
+    expect(playerReqs('playlist')).toHaveLength(0);
+  });
+});
+
+// Issue #505: an s3 clip source's own bucket must be used, not MINIO_BUCKET.
+describe('s3 clip references honour their own bucket (issue #505)', () => {
+  const addr = (bucket: string) => JSON.stringify({ type: 's3', bucket, key: 'story/a.mp4' });
+
+  it('presigns a bucket different from MINIO_BUCKET', async () => {
+    sourceDocs.set('src-clip', makeSourceDoc({ address: addr('other-bucket') }));
+    playerState = { state: 'paused', duration_ns: 9_000_000_000, position_ns: 0 };
+    await send({ type: 'CLIP_CUE', mixerInput: 'video_in_0' });
+
+    expect(errorFrames()).toHaveLength(0);
+    const file = (playerReqs('playlist')[0].body as { files: string[] }).files[0];
+    expect(file).toContain(`https://${S3_HOST}/other-bucket/story/a.mp4?`);
+    expect(file).not.toContain('/clips/');
+    expect(file).toContain('test-access-key%2F');
+    expect(preflightProbes.some((p) => p.url.startsWith(`https://${S3_HOST}/other-bucket/`))).toBe(true);
+  });
+
+  it('still uses MINIO_BUCKET-equal buckets exactly as before', async () => {
+    sourceDocs.set('src-clip', makeSourceDoc({ address: addr('clips') }));
+    playerState = { state: 'paused', duration_ns: 9_000_000_000, position_ns: 0 };
+    await send({ type: 'CLIP_CUE', mixerInput: 'video_in_0' });
+
+    expect(errorFrames()).toHaveLength(0);
+    expect((playerReqs('playlist')[0].body as { files: string[] }).files[0]).toContain(`https://${S3_HOST}/clips/story/a.mp4?`);
+  });
+
+  it('names both bucket and key when the object cannot be read', async () => {
+    sourceDocs.set('src-clip', makeSourceDoc({ address: addr('other-bucket') }));
+    s3Status = 403;
+    await send({ type: 'CLIP_CUE', mixerInput: 'video_in_0' });
+
+    expect(clipStates().at(-1)).toMatchObject({
+      state: 'error',
+      error: 'Clip URL returned HTTP 403 (bucket "other-bucket", key "story/a.mp4")',
+    });
     expect(playerReqs('playlist')).toHaveLength(0);
   });
 });

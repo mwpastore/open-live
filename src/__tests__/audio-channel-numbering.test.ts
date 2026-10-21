@@ -21,6 +21,7 @@ import Fastify from 'fastify';
 const SOURCES: Record<string, Record<string, unknown>> = {
   'cam-srt': { _id: 'cam-srt', name: 'Camera SRT', streamType: 'srt', address: 'srt://10.0.0.1:9000?mode=caller' },
   'cam-efp': { _id: 'cam-efp', name: 'Camera EFP', streamType: 'efp', address: 'srt://10.0.0.2:9000?mode=caller' },
+  'cam-guest': { _id: 'cam-guest', name: 'Guest', streamType: 'srt', address: 'srt://10.0.0.3:9000?mode=caller' },
 };
 
 const mockProductionGet = vi.fn();
@@ -90,7 +91,7 @@ const { activateStromFlow } = await import('../lib/flow-generator.js');
 const { StromClient } = await import('../lib/strom.js');
 const { default: audioRoutes } = await import('../routes/audio.js');
 const { handleMessage } = await import('../ws/controller.js');
-const { setTally } = await import('../services/tally.service.js');
+const { setTally, broadcast } = await import('../services/tally.service.js');
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -213,6 +214,58 @@ describe('audio channel numbering with test pattern sources', () => {
     expect(routing[0]!.body['properties']).toEqual({
       [`ch${channelByMixerInput['video_in_2']}_to_main`]: true,
       [`ch${channelByMixerInput['video_in_4']}_to_main`]: false,
+    });
+  });
+  // Issue #487: audio channel order must follow the NUMERIC picture order, not a
+  // lexical sort of mixerInput. A guest is allocated from the top of the range
+  // down (e.g. video_in_15), and large productions reach 10+ sources — both of
+  // which a `localeCompare` sort reordered wrongly ("video_in_15"/"video_in_10"
+  // sort before "video_in_2").
+  it('orders a guest on video_in_15 after the lower pads (numeric picture order)', async () => {
+    const { channelByMixerInput } = await generate([
+      { sourceId: '__test1__', mixerInput: 'video_in_0' },
+      { sourceId: '__test2__', mixerInput: 'video_in_1' },
+      { sourceId: 'cam-srt', mixerInput: 'video_in_2' },
+      { sourceId: 'cam-efp', mixerInput: 'video_in_3' },
+      { sourceId: 'cam-guest', mixerInput: 'video_in_15' },
+    ]);
+    // Picture order: HTML/test1(0), test2(1), SRT(2), EFP(3), Guest(15) → ch 1..5.
+    // The guest is the LAST channel, not channel 3 (the old lexical bug).
+    expect(channelByMixerInput).toEqual({
+      video_in_0: 1, video_in_1: 2, video_in_2: 3, video_in_3: 4, video_in_15: 5,
+    });
+  });
+
+  it('orders 10+ sources numerically (video_in_10/11 after video_in_2, not before)', async () => {
+    const sources = Array.from({ length: 12 }, (_, pad) => ({
+      sourceId: pad % 2 === 0 ? '__test1__' : '__test2__',
+      mixerInput: `video_in_${pad}`,
+    }));
+    const { channelByMixerInput } = await generate(sources);
+    const expected: Record<string, number> = {};
+    for (let pad = 0; pad < 12; pad++) expected[`video_in_${pad}`] = pad + 1;
+    expect(channelByMixerInput).toEqual(expected);
+  });
+
+  it('CUT broadcasts the AFV channel switches as AUDIO_STATE mute (#452)', async () => {
+    const { audioMixerId, channelByMixerInput } = await generate(MIXED);
+    setTally(PROD, { pgm: 'video_in_4', pvw: 'video_in_2' });
+
+    const ws = { send: vi.fn() } as unknown as import('@fastify/websocket').WebSocket;
+    const ctx = { audioBlockId: audioMixerId };
+    await handleMessage(PROD, ws, JSON.stringify({ type: 'AFV_SET', mixerInput: 'video_in_2', enabled: true }), ctx);
+    await handleMessage(PROD, ws, JSON.stringify({ type: 'AFV_SET', mixerInput: 'video_in_4', enabled: true }), ctx);
+    patches.length = 0;
+    vi.mocked(broadcast).mockClear();
+
+    await handleMessage(PROD, ws, JSON.stringify({ type: 'CUT', mixerInput: 'video_in_2' }), ctx);
+    const ch2 = `ch${channelByMixerInput['video_in_2']}`;
+    const ch4 = `ch${channelByMixerInput['video_in_4']}`;
+    // applyAudioFollow is fired without awaiting; wait for its broadcasts.
+    await vi.waitFor(() => {
+      const frames = vi.mocked(broadcast).mock.calls.map((c) => c[1] as Record<string, unknown>);
+      expect(frames).toContainEqual({ type: 'AUDIO_STATE', elementId: ch2, property: 'mute', value: false });
+      expect(frames).toContainEqual({ type: 'AUDIO_STATE', elementId: ch4, property: 'mute', value: true });
     });
   });
 });

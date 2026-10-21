@@ -4,22 +4,34 @@ import { z } from 'zod';
 import { getDb, getSourcesDb, getGuestSessionsDb, getGuestInvitesDb } from '../db/index.js';
 import { updateProductionDoc } from '../routes/productions.js';
 import type { ProductionDoc, ClipState, SourceDoc, GuestSessionState } from '../db/types.js';
-import { getTally, setTally, subscribe, unsubscribe, broadcast, nextSeq, currentSeq } from '../services/tally.service.js';
+import { getTally, setTally, subscribe, unsubscribe, broadcast, nextSeq, currentSeq, getOperatorSockets, getSockets, beginSnapshot, endSnapshot } from '../services/tally.service.js';
 import {
   cueClip, playClip, stopClip, pauseClip, seekClip,
-  resolveClipSource, resolveClipTarget,
+  resolveClipSource, resolveCueSource, resolvePersistedCueSource, assertSlotNotPlaying, ClipSlotPlayingError, resolveClipTarget,
   ClipNotFoundError, ClipNotActivatedError, ClipNotCuedError, ClipMediaError,
 } from '../lib/clip-control.js';
 import { getClipStateEntry, getAllClipStates, setClipStateEntry, clearClipState } from '../services/clip-state.service.js';
 import { persistClipCue, clearPersistedClipCue } from '../services/clip-cue-store.js';
-import { startClipRelay, stopClipRelay } from '../services/clip-relay.js';
+import { startClipRelay, stopClipRelay, reconcileClipRelay } from '../services/clip-relay.js';
 import { CONTRACT_VERSION, computeTallyContributions } from '../services/automation-contract.js';
-import { startMeterRelay, stopMeterRelay } from '../services/meter-relay.js';
+import { startMeterRelay, stopMeterRelay, reconcileMeterRelay } from '../services/meter-relay.js';
+import { guestInputBlocks, guestHealthSnapshot } from '../services/guest-health.js';
 import { StromClient, StromClientError, StromPropertiesRejectedError, type TransitionType as StromTransitionType, type PipZone, type PipConfig, type PipTransforms, type VideoEffect, type EffectTarget, type SetVideoEffectRequest } from '../lib/strom.js';
+import { mixerInputToStromPad, storedPadToStromPad, expandToStoredPadIndex } from '../lib/mixer-input-map.js';
 import { getStromToken } from '../lib/strom-token.js';
 import { graphicUrl } from '../lib/url-validation.js';
 import { decryptAddressPassphrase } from '../lib/srt-passphrase-crypto.js';
 import { loadAudioChannels } from '../lib/audio-channels.js';
+import {
+  type AudioProcStage,
+  type StageParams,
+  parseStageParams,
+  stageAllowedOnElement,
+  stageToStromProps,
+  mergeIntoStore,
+  allStoredStages,
+  liveStromPropsFromStore,
+} from '../lib/audio-processing.js';
 import {
   mirrorToMainForPersistedReturns,
   returnSendMatrix,
@@ -30,6 +42,7 @@ import { config } from '../config.js';
 import { notifySubscriberJoin, resetIdleTimer } from '../services/idle-watchdog.js';
 import { activePflByProduction, activeAflByProduction, anySoloActive, numAudioChannelsByProduction } from '../services/pfl-state.js';
 import { buildProductionStatusEvent, deriveOutputSnapshot } from '../lib/production-health.js';
+import { getWhipIngestState } from '../services/whip-ingest-state.js';
 
 function stromErrorMessage(err: unknown): string {
   if (err instanceof StromClientError) return err.message;
@@ -57,11 +70,34 @@ const RATE_LIMIT_WINDOW_MS = 1000;
 /** Message types whose processing is expensive enough to warrant a tighter cap. */
 const EXPENSIVE_MESSAGE_TYPES = new Set(['MACRO_EXEC', 'GO_LIVE', 'CUT_STREAM', 'HTML_SOURCE_EVENT']);
 
-/** Per-connection sliding-window timestamps. Lives on the connection ctx so it
- * is garbage-collected when the socket closes (no global registry to leak). */
+/** Human-facing error string for a rate-limited message. Kept as a single
+ * constant so the coalesced ERROR frame and the per-cmdId NACK stay identical. */
+const RATE_LIMIT_ERROR = 'Rate limit exceeded';
+
+/** Per-connection sliding-window timestamps plus the coalesced drop-handling
+ * state (issue #469). Lives on the connection ctx so it is garbage-collected
+ * when the socket closes (no global registry to leak). */
 interface RateLimitState {
   general: number[];
   expensive: number[];
+  /**
+   * Drop-window bookkeeping. When a message is dropped we open a window that
+   * drains after one RATE_LIMIT_WINDOW_MS; while it is open at most one ERROR
+   * frame is emitted for all uncorrelated drops, the latest value of each
+   * idempotent setter target is retained, and on drain we log the aggregate
+   * drop count and re-apply the retained setters so the final value lands.
+   */
+  droppedCount: number;
+  errorSentThisWindow: boolean;
+  /** Latest retained raw message per coalesce key (idempotent setters only). */
+  pendingSetters: Map<string, string>;
+  /** Active drain timer, or undefined when no drop window is open. */
+  flushTimer?: ReturnType<typeof setTimeout>;
+}
+
+/** Fresh per-connection rate-limit state. */
+function createRateLimitState(): RateLimitState {
+  return { general: [], expensive: [], droppedCount: 0, errorSentThisWindow: false, pendingSetters: new Map() };
 }
 
 /**
@@ -83,6 +119,130 @@ function checkRateLimit(state: RateLimitState, isExpensive: boolean, now: number
 
   state.general.push(now);
   return true;
+}
+
+/** Per-connection message context, threaded through `handleMessage`. Mutable so
+ * the audio block id resolved at connect time is reused on later AUDIO_SET
+ * messages, and so the rate-limit state survives across messages. */
+interface ControllerMsgCtx {
+  audioBlockId?: string;
+  rateLimit?: RateLimitState;
+}
+
+/**
+ * Coalesce key for an idempotent "set latest value" message (issue #469). When
+ * such a message is dropped by the rate limit we keep only the newest value per
+ * target, so the final value of a drag always lands when the window drains.
+ * Returns null for commands and anything whose intermediate values matter — those
+ * keep today's drop semantics (dropped outright, not replayed).
+ */
+function coalesceKey(msg: InboundMessage): string | null {
+  switch (msg.type) {
+    case 'SET_EFFECT':
+      return `SET_EFFECT:${msg.target === 'master' ? 'master' : `input:${msg.target.input}`}`;
+    case 'AUDIO_SET':
+      return `AUDIO_SET:${msg.elementId}:${msg.property}`;
+    case 'AUDIO_PROC_SET':
+      return `AUDIO_PROC_SET:${msg.elementId}:${msg.stage}`;
+    case 'AUX_SEND_SET':
+      return `AUX_SEND_SET:${msg.elementId}:${msg.auxBus}`;
+    case 'AUX_MASTER_SET':
+      return `AUX_MASTER_SET:${msg.auxBus}`;
+    case 'GRP_SEND_SET':
+      return `GRP_SEND_SET:${msg.elementId}:${msg.grpBus}`;
+    case 'GRP_MASTER_SET':
+      return `GRP_MASTER_SET:${msg.grpBus}`;
+    case 'MONITOR_SET':
+      return 'MONITOR_SET';
+    case 'SOURCE_OFFSET_SET':
+      return `SOURCE_OFFSET_SET:${msg.mixerInput}`;
+    case 'SOURCE_AUDIO_OFFSET_SET':
+      return `SOURCE_AUDIO_OFFSET_SET:${msg.mixerInput}`;
+    default:
+      return null;
+  }
+}
+
+/**
+ * Handle a message rejected by the rate limiter (issue #469). Previously every
+ * dropped message produced its own ERROR/NACK and nothing was logged, so a
+ * ~100/s slider drag became a storm of toasts and a dropped final position left
+ * the effect stale. Now, for the duration of one drop window:
+ *   - correlated commands (carrying a `cmdId`) still get their individual NACK,
+ *     so the automation contract's per-cmdId resolution is preserved;
+ *   - all uncorrelated drops share a single ERROR frame;
+ *   - the latest value of each idempotent setter target is retained and
+ *     re-applied when the window drains, so the final value is never lost;
+ *   - the aggregate drop count is logged once, at `warn`, when the window drains.
+ */
+function handleRateLimitedMessage(
+  ctx: ControllerMsgCtx,
+  productionId: string,
+  ws: WebSocket,
+  msg: InboundMessage,
+  raw: string,
+): void {
+  const state = ctx.rateLimit!;
+
+  // Open a drop window on the first drop; it drains after one window length.
+  if (state.flushTimer === undefined) {
+    state.droppedCount = 0;
+    state.errorSentThisWindow = false;
+    state.pendingSetters.clear();
+    state.flushTimer = setTimeout(() => drainDropWindow(ctx, productionId, ws), RATE_LIMIT_WINDOW_MS);
+    // Do not keep the event loop alive solely for a pending drop window.
+    state.flushTimer.unref?.();
+  }
+  state.droppedCount++;
+
+  const cmdId = 'cmdId' in msg ? (msg.cmdId as string | undefined) : undefined;
+  if (cmdId) {
+    // Correlated command: keep existing semantics — one NACK per command so the
+    // client's cmdId always resolves. These are not the source of the toast storm.
+    sendNack(ws, productionId, cmdId, RATE_LIMIT_ERROR);
+    return;
+  }
+
+  // Idempotent setter: retain only the latest value for this target.
+  const key = coalesceKey(msg);
+  if (key) state.pendingSetters.set(key, raw);
+
+  // At most one ERROR frame per window for all uncorrelated drops.
+  if (!state.errorSentThisWindow) {
+    ws.send(JSON.stringify({ type: 'ERROR', error: RATE_LIMIT_ERROR }));
+    state.errorSentThisWindow = true;
+  }
+}
+
+/**
+ * Drain an open drop window: log the aggregate drop count once at `warn`, then
+ * re-apply the latest retained value for each setter target. Re-entering
+ * `handleMessage` runs each replay through the (now-drained) sliding window; if
+ * the burst is still saturating the window the replay is simply re-dropped and
+ * retained again, so the final value still converges.
+ */
+function drainDropWindow(ctx: ControllerMsgCtx, productionId: string, ws: WebSocket): void {
+  const state = ctx.rateLimit;
+  if (!state) return;
+
+  const dropped = state.droppedCount;
+  const pending = state.pendingSetters;
+  state.flushTimer = undefined;
+  state.droppedCount = 0;
+  state.errorSentThisWindow = false;
+  state.pendingSetters = new Map();
+
+  if (dropped > 0) {
+    console.warn(
+      `[controller] rate limit: dropped ${dropped} message(s) on production ${productionId} in the last ${RATE_LIMIT_WINDOW_MS}ms`,
+    );
+  }
+
+  for (const raw of pending.values()) {
+    void handleMessage(productionId, ws, raw, ctx).catch((err) => {
+      console.error('[controller] rate-limit replay error:', err);
+    });
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -198,6 +358,7 @@ type InboundMessage =
   | { type: 'DSK_TOGGLE'; layer: number; visible?: boolean; cmdId?: string }
   | { type: 'MACRO_EXEC'; macroId: string; cmdId?: string }
   | { type: 'AUDIO_SET'; elementId: string; property: 'volume' | 'mute'; value: unknown; ramp_ms?: number; cmdId?: string }
+  | { type: 'AUDIO_PROC_SET'; elementId: string; stage: AudioProcStage; params: Record<string, unknown>; cmdId?: string }
   | { type: 'AFV_SET'; mixerInput: string; enabled: boolean; cmdId?: string }
   | { type: 'AFV_RAMP_SET'; rampUpMs: number; rampDownMs: number; cmdId?: string }
   | { type: 'PFL_SET'; elementId: string; enabled: boolean; volume?: number; cmdId?: string }
@@ -280,6 +441,17 @@ const InboundMessageSchema = z.discriminatedUnion('type', [
     property: z.enum(['volume', 'mute']),
     value: z.union([z.number().min(0).max(10), z.boolean()]),
     ramp_ms: rampMsSchema.optional(),
+    cmdId: cmdIdSchema,
+  }),
+  // Audio processing control (issue #527, OL-25). The envelope is validated here;
+  // `params` is validated per-stage in the handler against the Strom ranges
+  // (src/lib/audio-processing.ts) so an out-of-range value NACKs with a clear
+  // message and nothing reaches Strom.
+  z.object({
+    type: z.literal('AUDIO_PROC_SET'),
+    elementId: elementIdSchema,
+    stage: z.enum(['gain', 'hpf', 'gate', 'comp', 'eq', 'limiter']),
+    params: z.record(z.string(), z.unknown()),
     cmdId: cmdIdSchema,
   }),
   z.object({ type: z.literal('AFV_SET'), mixerInput: mixerInputSchema, enabled: z.boolean(), cmdId: cmdIdSchema }),
@@ -390,15 +562,29 @@ function padToIndex(mixerInput: string): number | null {
 }
 
 /**
+ * Translate a PiP config's zone `sources` (stored pad indices) to the COMPACT
+ * Strom pad indices actually wired in the flow (issue #463). In-memory and
+ * broadcast PiP state stays in stored space; this runs only at the Strom boundary.
+ */
+function remapZonesToStromPads(zones: PipZone[], map: Record<string, number> | undefined): PipZone[] {
+  if (!map) return zones;
+  return zones.map((z) => ({ ...z, sources: z.sources.map((s) => storedPadToStromPad(s, map)) }));
+}
+
+/**
  * `from_input` / `to_input` for a Strom take between two backgrounds. Strom's
  * vision mixer ignores both and swaps its own PGM/PVW buses (input and PiP),
  * so they only describe the take; equal values are harmless. An unknown end
- * is sent as 0, as Strom's own web UI does.
+ * is sent as 0, as Strom's own web UI does. Indices are compact Strom pads (#463).
  */
-function takeInputIndices(from: string | null, to: string | null): { from_input: number; to_input: number } {
+function takeInputIndices(
+  from: string | null,
+  to: string | null,
+  map: Record<string, number> | undefined,
+): { from_input: number; to_input: number } {
   return {
-    from_input: from ? (padToIndex(from) ?? 0) : 0,
-    to_input: to ? (padToIndex(to) ?? 0) : 0,
+    from_input: from ? (mixerInputToStromPad(from, map) ?? 0) : 0,
+    to_input: to ? (mixerInputToStromPad(to, map) ?? 0) : 0,
   };
 }
 
@@ -471,7 +657,9 @@ async function stromTransition(
     console.warn('[controller] Strom transition skipped — no toMixerInput');
     return true;
   }
-  const toIndex = padToIndex(toMixerInput);
+  // Translate the stored mixerInput to the COMPACT Strom pad index (issue #463).
+  // Identity when this production has no compaction map.
+  const toIndex = mixerInputToStromPad(toMixerInput, doc.mixerInputMap);
   if (toIndex === null) {
     console.warn('[controller] Strom transition skipped — cannot parse index from pad:', toMixerInput);
     return true;
@@ -479,7 +667,7 @@ async function stromTransition(
   // Set Strom's PVW to the target input first, then fire the transition. A
   // vision mixer ignores from_input/to_input and swaps PGM with whatever is in
   // its preview, so the preview select is what picks the target.
-  const fromIndex = fromMixerInput ? (padToIndex(fromMixerInput) ?? toIndex) : toIndex;
+  const fromIndex = fromMixerInput ? (mixerInputToStromPad(fromMixerInput, doc.mixerInputMap) ?? toIndex) : toIndex;
   const strom = await makeStromClient();
   try {
     // Strom rejects previewing the input that is already the sole program
@@ -513,7 +701,8 @@ async function stromTransition(
  * input (allowed while a PiP is on PGM) and then fires the take, which swaps
  * Strom's buses: the target goes to PGM and the PiP to PVW, matching the state
  * broadcast here. As in CUT/TRANSITION, PIP_STATE waits for the take to succeed
- * (#355) and is skipped if PVW changed during the round trip (#341).
+ * (#355) and is skipped if PVW changed during the round trip (#341). A take
+ * Strom rejects is rolled back (#430) and reported by returning false.
  */
 async function takePipOffToBackground(
   productionId: string,
@@ -522,7 +711,8 @@ async function takePipOffToBackground(
   pgmPip: number,
   persistLabel: string,
   transitionMeta?: { transitionType?: string; durationMs?: number },
-): Promise<void> {
+): Promise<boolean> {
+  const preSwitch = snapshotSwitchState(productionId);
   const newTally = { pgm: target, pvw: null };
   setTally(productionId, newTally);
   pgmPipByProduction.set(productionId, null);
@@ -540,9 +730,14 @@ async function takePipOffToBackground(
     toStromTransition(transitionMeta?.transitionType ?? 'cut'),
     transitionMeta?.durationMs,
   );
-  if (ok && (pvwPipByProduction.get(productionId) ?? null) === pgmPip) {
+  if (!ok) {
+    await restoreSwitchState(productionId, doc, preSwitch);
+    return false;
+  }
+  if ((pvwPipByProduction.get(productionId) ?? null) === pgmPip) {
     broadcast(productionId, { type: 'PIP_STATE', pgmPip: null, pvwPip: pgmPip, pips: pipConfigsByProduction.get(productionId) ?? [] });
   }
+  return true;
 }
 
 /**
@@ -559,6 +754,84 @@ function rebroadcastMixerState(productionId: string, doc: ProductionDoc): void {
     pvwPip: pvwPipByProduction.get(productionId) ?? null,
     pips: pipConfigsByProduction.get(productionId) ?? [],
   });
+}
+
+// ---------------------------------------------------------------------------
+// #430: rolling back a switch Strom rejected
+//
+// A CUT/TRANSITION/TAKE mutates the tally, the PiP maps, and the persisted doc,
+// then broadcasts TALLY *before* awaiting Strom's /transition. #355 already
+// stopped the controller from *announcing a displaced PiP* (the deferred
+// PIP_STATE + preview restore) when that transition is rejected, but the tally,
+// the PiP-map mutations, and the persisted doc were still left on the new value.
+// Clients were therefore told the new source is on program (via the already-sent
+// TALLY) while Strom kept airing the old one, until the next successful switch.
+//
+// `snapshotSwitchState` captures the pre-switch state before any mutation, and
+// `restoreSwitchState` rolls all of it back and re-broadcasts the authoritative
+// TALLY + PIP_STATE so every client drops the switch it optimistically showed.
+// Applied on every CUT/TRANSITION/TAKE path, interactive and macro.
+// ---------------------------------------------------------------------------
+
+interface SwitchStateSnapshot {
+  tally: { pgm: string | null; pvw: string | null };
+  pgmPip: number | null;
+  pvwPip: number | null;
+}
+
+/**
+ * Snapshot the controller's switch-related state so a rejected transition can be
+ * rolled back. Must be called before the handler mutates any of it. The tally is
+ * copied (getTally returns the live stored object, which some handlers mutate in
+ * place).
+ */
+function snapshotSwitchState(productionId: string): SwitchStateSnapshot {
+  return {
+    tally: { ...getTally(productionId) },
+    pgmPip: pgmPipByProduction.get(productionId) ?? null,
+    pvwPip: pvwPipByProduction.get(productionId) ?? null,
+  };
+}
+
+/**
+ * Restore the pre-switch snapshot after Strom rejected the transition (#430):
+ * roll back the tally, the PGM/PVW PiP maps (which also fix each PiP's background,
+ * see `pgmBgOf`), and the persisted doc, then re-broadcast the authoritative TALLY
+ * and PIP_STATE. The absent-key and null-value readings of
+ * these maps are equivalent everywhere they are consumed (reads coalesce with
+ * `?? null`), so restoring with `set` is faithful.
+ */
+async function restoreSwitchState(
+  productionId: string,
+  doc: ProductionDoc,
+  snapshot: SwitchStateSnapshot,
+): Promise<void> {
+  setTally(productionId, { pgm: snapshot.tally.pgm, pvw: snapshot.tally.pvw });
+  pgmPipByProduction.set(productionId, snapshot.pgmPip);
+  pvwPipByProduction.set(productionId, snapshot.pvwPip);
+  await persistMixerMutation(productionId, 'SWITCH_REJECTED_ROLLBACK', (d) => ({ ...d, tally: snapshot.tally }));
+  broadcast(productionId, { type: 'TALLY', ...buildTallyPayload(productionId, snapshot.tally, doc) });
+  broadcast(productionId, {
+    type: 'PIP_STATE',
+    pgmPip: snapshot.pgmPip,
+    pvwPip: snapshot.pvwPip,
+    pips: pipConfigsByProduction.get(productionId) ?? [],
+  });
+}
+
+/**
+ * Tell the operator a switch was rejected by Strom. Mirrors the not-found guard:
+ * a NACK when the command carried a cmdId (two-phase ACK), an ERROR frame
+ * otherwise. The caller must NOT also send an `executed` ACK — the switch never
+ * reached air.
+ */
+function notifySwitchRejected(ws: WebSocket, productionId: string, cmdId: string | undefined): void {
+  const error = 'Switch rejected by Strom';
+  if (cmdId) {
+    sendNack(ws, productionId, cmdId, error);
+  } else {
+    ws.send(JSON.stringify({ type: 'ERROR', error }));
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -758,6 +1031,8 @@ function buildTallyPayload(
   pgm: string | null;
   pvw: string | null;
   pgmBg: string | null;
+  pgmPip: number | null;
+  pvwPip: number | null;
   program: string[];
   preview: string[];
   contributions: Array<{ source: string; role: string }>;
@@ -781,7 +1056,7 @@ function buildTallyPayload(
     activeGraphics,
   );
 
-  return { pgm: tally.pgm, pvw: tally.pvw, pgmBg, program, preview, contributions };
+  return { pgm: tally.pgm, pvw: tally.pvw, pgmBg, pgmPip, pvwPip, program, preview, contributions };
 }
 
 
@@ -795,6 +1070,12 @@ export function clearAudioState(productionId: string): void {
   sourceAudioOffsetsByProduction.delete(productionId)
   numAudioChannelsByProduction.delete(productionId)
   channelLevelsByProduction.delete(productionId)
+  // A write still in flight keeps its own record and settles on its own; it
+  // must not count as overlapping with writes made after reactivation.
+  const keyPrefix = `${productionId}:`
+  for (const map of [muteWritesInFlight, latestMuteWrite, latestVolumeWrite]) {
+    for (const key of map.keys()) if (key.startsWith(keyPrefix)) map.delete(key)
+  }
   auxSendByProduction.delete(productionId)
   auxMasterByProduction.delete(productionId)
   grpSendByProduction.delete(productionId)
@@ -802,6 +1083,186 @@ export function clearAudioState(productionId: string): void {
   monitorByProduction.delete(productionId)
   pgmPipByProduction.delete(productionId)
   pvwPipByProduction.delete(productionId)
+}
+
+/**
+ * Tells every connected socket the mixer state after first-connect init. Levels
+ * come from the cache rather than the init defaults, so a fader moved while the
+ * init write was in flight is not reported back at unity.
+ */
+function broadcastAudioReset(productionId: string, numChannels: number, muted: Set<string>): void {
+  const levels = channelLevelsByProduction.get(productionId);
+  // A fader Strom refused is absent from the cache; skip it rather than report unity.
+  const sendLevel = (elementId: string) => {
+    const level = levels?.get(elementId);
+    if (level !== undefined) broadcast(productionId, { type: 'AUDIO_STATE', elementId, property: 'volume', value: level });
+  };
+  for (let i = 1; i <= numChannels; i++) {
+    sendLevel(`ch${i}`);
+    broadcast(productionId, { type: 'AUDIO_STATE', elementId: `ch${i}`, property: 'mute', value: muted.has(`ch${i}`) });
+  }
+  sendLevel('main');
+}
+
+/**
+ * The relay refs each socket holds: `meter` is the meter relay's generation,
+ * `clip` the flow of the clip relay (watch-only sockets hold meter refs only).
+ * A socket releases on close only what it holds, and reinit takes refs on
+ * behalf of sockets that stayed open across a reactivation.
+ */
+type RelayHold = { meter?: number; clip?: string };
+const relayHolds = new WeakMap<WebSocket, RelayHold>();
+
+function relayHold(ws: WebSocket): RelayHold {
+  let hold = relayHolds.get(ws);
+  if (!hold) {
+    hold = {};
+    relayHolds.set(ws, hold);
+  }
+  return hold;
+}
+
+/**
+ * Re-run first-connect audio init and restart the meter/clip relays for a
+ * production that has just (re)activated with a NEW Strom flow, targeting the
+ * controller operators that stayed connected across a deactivate→reactivate
+ * cycle (issue #416).
+ *
+ * On deactivate both relays are force-stopped and `clearAudioState` wipes the
+ * per-production registries, but a controller socket that stays open is never
+ * re-run through the WS connect handler. Without this, such a socket sits on the
+ * OLD flow's (now torn-down) relays — so no client gets METER_DATA/LOUDNESS_DATA
+ * or CLIP_STATE — and on an un-initialised mixer whose NEXT fresh connect would
+ * run first-connect init and reset every channel to fader 1.0 / unmuted / to
+ * main, clobbering any change made since reactivation.
+ *
+ * Fixing it here: when at least one operator is connected, initialise the new
+ * flow's audio ONCE (so a later fresh connect inherits rather than re-inits).
+ * Restart the meter relay for every connected socket and the clip relay for
+ * every operator socket, taking one ref per socket that does not already hold
+ * one on this flow, so each relay is torn down only when the last of those
+ * sockets closes. Watch-only sockets never trigger init. A no-op when nobody is
+ * connected — the next connect runs the normal path.
+ */
+export async function reinitConnectedControllers(productionId: string): Promise<void> {
+  if (getSockets(productionId).length === 0) return;
+  const hasOperator = getOperatorSockets(productionId).length > 0;
+
+  let doc: ProductionDoc;
+  try {
+    doc = await getDb().get(productionId) as ProductionDoc;
+  } catch {
+    return;
+  }
+  if (!doc.stromFlowId) return;
+  const flowId = doc.stromFlowId;
+
+  // Mark the new flow as current so a subsequent fresh connect does not treat it
+  // as a pipeline change and wipe the state we are about to initialise.
+  if (hasOperator) activeFlowIdByProduction.set(productionId, flowId);
+
+  try {
+    const strom = await makeStromClient();
+    const { flow } = await strom.flows.get(flowId);
+    const blocks = flow.blocks ?? [];
+    // A socket that stayed open across reactivation may still show a guest
+    // failure from the old flow; the new flow's health replaces it.
+    const guestBlocks = guestInputBlocks(doc);
+    for (const message of guestHealthSnapshot(guestBlocks, flow.block_health)) broadcast(productionId, message);
+    const audioBlockId = doc.audioMixerBlockId ?? blocks.find((b) => b.block_definition_id === 'builtin.mixer')?.id;
+    if (audioBlockId) {
+      const mixerBlock = blocks.find((b) => b.id === audioBlockId);
+      const rawNumCh = mixerBlock?.properties?.num_channels;
+      const numChannels = typeof rawNumCh === 'number' ? rawNumCh
+        : typeof rawNumCh === 'string' ? parseInt(rawNumCh, 10)
+        : 0;
+      if (hasOperator) numAudioChannelsByProduction.set(productionId, numChannels);
+
+      // Initialise ONCE. If clearAudioState already ran (deactivate) the registry
+      // is cold; if some fresh connect raced ahead and initialised the new flow,
+      // leave its state untouched.
+      const isFirstInit = hasOperator && !afvChannelsByProduction.has(productionId);
+      if (isFirstInit) {
+        afvChannelsByProduction.set(productionId, new Set());
+        const muted = new Set<string>();
+        mutedElementsByProduction.set(productionId, muted);
+        const initProps: Record<string, unknown> = {};
+        const levelCache = channelLevelsByProduction.get(productionId) ?? new Map<string, number>();
+        for (let i = 1; i <= numChannels; i++) {
+          initProps[`ch${i}_fader`] = 1.0;
+          initProps[`ch${i}_mute`] = false;
+          initProps[`ch${i}_to_main`] = true;
+          levelCache.set(`ch${i}`, 1.0);
+        }
+        initProps['main_fader'] = 1.0;
+        levelCache.set('main', 1.0);
+        channelLevelsByProduction.set(productionId, levelCache);
+        // The init leaves main mute alone, but this is a new flow: a socket that
+        // stayed open still shows the old flow's main mute.
+        let mainMuted: boolean | undefined;
+        // Mirror the first-connect guard (#396): a channel Strom refused to route
+        // to main is reported muted rather than falsely told live.
+        const seedMutes = (rejected: Record<string, unknown>, current: Record<string, unknown>) => {
+          for (let i = 1; i <= numChannels; i++) {
+            const toMainKey = `ch${i}_to_main`;
+            if (Object.hasOwn(rejected, toMainKey) || current[toMainKey] === false) muted.add(`ch${i}`);
+          }
+          mainMuted = stromMuteState('main', current);
+        };
+        const applied = await strom.flows.updateBlockProperties(flowId, audioBlockId, { properties: initProps })
+          .then((res) => { seedMutes(res.rejected ?? {}, res.properties ?? {}); return true; })
+          .catch((err) => {
+            console.warn('[controller] reinit channel props error:', err);
+            // Keys are independent, so keep what applied; forget a refused fader's
+            // unity level so it is not broadcast below.
+            if (!(err instanceof StromPropertiesRejectedError)) return false;
+            for (const key of Object.keys(err.rejected)) {
+              const fader = /^(ch\d+|main)_fader$/.exec(key);
+              if (fader) levelCache.delete(fader[1]);
+            }
+            seedMutes(err.rejected, err.current);
+            return true;
+          });
+        // Push the freshly-initialised defaults to every connected socket so one
+        // that stayed open across reactivation drops its stale mixer view.
+        // Skipped when the write failed outright: Strom still holds the old values.
+        if (applied) broadcastAudioReset(productionId, numChannels, muted);
+        if (applied && mainMuted !== undefined) {
+          broadcast(productionId, { type: 'AUDIO_STATE', elementId: 'main', property: 'mute', value: mainMuted });
+        }
+        broadcast(productionId, { type: 'GRP_STATE_RESET' });
+      }
+
+      // Restart the meter relay against the NEW flow. Deactivate force-stopped
+      // (and forgot) the relay while leaving each socket's per-socket hold in
+      // place, and a connect mid-teardown may have re-created it on the retired
+      // flow. Reconcile to one ref per socket on the new flow, watchers included,
+      // rather than taking a per-socket ref: the latter both fails to re-create a
+      // force-stopped relay for a socket that stayed open AND double-counts the
+      // mid-teardown socket, orphaning a ref that never reaches zero (issue
+      // #434). Every socket then releases exactly one ref on close, landing the
+      // relay back at zero.
+      const meterSockets = getSockets(productionId);
+      const meterGeneration = reconcileMeterRelay(productionId, flowId, audioBlockId, doc.loudnessMainBlockId, meterSockets.length, guestBlocks);
+      for (const ws of meterSockets) relayHold(ws).meter = meterGeneration;
+    }
+  } catch (err) {
+    console.warn('[controller] reinit audio/meter error:', err);
+  }
+
+  // Restart the clip relay against the NEW flow (same ref-count reasoning).
+  if (doc.clipPlayerBlockIds) {
+    const blockToInput = new Map<string, string>();
+    for (const [mixerInput, blockId] of Object.entries(doc.clipPlayerBlockIds)) {
+      blockToInput.set(blockId, mixerInput);
+    }
+    if (blockToInput.size > 0) {
+      // Same reconciliation as the meter relay above (issue #434).
+      const clipOperators = getOperatorSockets(productionId);
+      reconcileClipRelay(productionId, flowId, blockToInput, clipOperators.length);
+      for (const ws of clipOperators) relayHold(ws).clip = flowId;
+    }
+  }
 }
 
 /**
@@ -855,6 +1316,13 @@ export function setPipConfigSlot(productionId: string, pip: number, cfg: PipConf
  */
 export function hydratePipConfigsFromDoc(doc: ProductionDoc): PipConfig[] | null {
   if (pipConfigsByProduction.has(doc._id)) return null
+  const { configs, persisted } = pipConfigsFromDoc(doc)
+  if (configs) pipConfigsByProduction.set(doc._id, configs)
+  return persisted ? configs : null
+}
+
+/** The PiP layout the doc implies, without touching the cache. */
+function pipConfigsFromDoc(doc: ProductionDoc): { configs: PipConfig[] | null; persisted: boolean } {
   const rawNumPips = doc.values?.num_pips
   const numPips = typeof rawNumPips === 'number' ? Math.max(0, Math.round(rawNumPips))
     : typeof rawNumPips === 'string' ? Math.max(0, parseInt(rawNumPips, 10) || 0)
@@ -865,13 +1333,12 @@ export function hydratePipConfigsFromDoc(doc: ProductionDoc): PipConfig[] | null
     // num_pips even if it changed since the layout was saved.
     const restored = Array.from({ length: Math.max(numPips, persisted.length) }, (_, i) =>
       persisted[i] ?? { bg: null, zones: [], transforms: {} })
-    pipConfigsByProduction.set(doc._id, restored)
-    return restored
+    return { configs: restored, persisted: true }
   }
   if (numPips > 0) {
-    pipConfigsByProduction.set(doc._id, Array.from({ length: numPips }, () => ({ bg: null, zones: [], transforms: {} })))
+    return { configs: Array.from({ length: numPips }, () => ({ bg: null, zones: [], transforms: {} })), persisted: false }
   }
-  return null
+  return { configs: null, persisted: false }
 }
 
 /** Wipe all per-production FX state. Called when the pipeline changes or production deactivates. */
@@ -1079,8 +1546,23 @@ async function applyAudioFollow(
     toMainChanges,
   ));
   if (Object.keys(properties).length > 0) {
-    await strom.flows.updateBlockProperties(stromFlowId, audioBlockId, { properties, ramp_ms_overrides })
-      .catch((err) => console.warn('[controller] audio follow error:', String(err)));
+    const result = await strom.flows.updateBlockProperties(stromFlowId, audioBlockId, { properties, ramp_ms_overrides })
+      .catch((err) => { console.warn('[controller] audio follow error:', String(err)); return null; });
+    // Tell clients what actually reached Strom, in the same AUDIO_STATE mute shape
+    // as AFV_SET / manual mute (mute = !chN_to_main), instead of leaving them to
+    // infer the mix from AFV_STATE + TALLY (#452). Skipped when the write failed;
+    // a channel Strom refused is reported at the value it kept (as in #396), and
+    // omitted if Strom gave no value back for it.
+    if (result) {
+      for (const [channel, routed] of toMainChanges) {
+        const key = `ch${channel + 1}_to_main`;
+        const reported = result.properties?.[key];
+        const rejected = Object.prototype.hasOwnProperty.call(result.rejected ?? {}, key);
+        const actual = typeof reported === 'boolean' ? reported : rejected ? null : routed;
+        if (actual === null) continue;
+        broadcast(productionId, { type: 'AUDIO_STATE', elementId: `ch${channel + 1}`, property: 'mute', value: !actual });
+      }
+    }
   }
 }
 
@@ -1170,12 +1652,66 @@ export async function applyReturnMode(
 // Message handler
 // ---------------------------------------------------------------------------
 
+/**
+ * Commands that mutate the vision mixer (issue #431). Each one reads the
+ * production doc, calls Strom, and persists the resulting tally. Two of them
+ * racing — e.g. a CUT whose DB write is slow, then a TAKE sent 20 ms later —
+ * could otherwise reach Strom in the opposite order the operator pressed them,
+ * leaving Strom on one program while open-live reports another. They are
+ * serialised per production (see `runSerializedSwitcherCommand`) so one
+ * command's Strom calls and DB write finish before the next reads the doc.
+ *
+ * MACRO_EXEC is included because a macro inlines its own CUT/TRANSITION/TAKE
+ * sub-commands (it never re-enters `handleMessage`), so holding the lock for a
+ * whole macro serialises the macro's switcher effects without any risk of the
+ * macro deadlocking on its own queue.
+ */
+const SWITCHER_MESSAGE_TYPES = new Set([
+  'CUT',
+  'TRANSITION',
+  'TAKE',
+  'SET_PVW',
+  'SELECT_PVW_PIP',
+  'SET_PIP',
+  'MACRO_EXEC',
+]);
+
+/**
+ * Per-production tail of the switcher-command chain. Each entry is a
+ * never-rejecting promise that settles when the production's most recently
+ * queued switcher command finishes; the entry is pruned once the chain drains.
+ */
+const switcherCommandChains = new Map<string, Promise<unknown>>();
+
+/**
+ * Run `task` after the previous switcher command for the same production has
+ * fully settled (success or failure), guaranteeing per-production ordering of
+ * the doc read → Strom call → DB write sequence. The caller still observes its
+ * own task's outcome via the returned promise; the internal chain tail swallows
+ * rejections so one failed command never stalls the queue.
+ */
+function runSerializedSwitcherCommand(
+  productionId: string,
+  task: () => Promise<void>,
+): Promise<void> {
+  const prev = switcherCommandChains.get(productionId) ?? Promise.resolve();
+  const result = prev.then(() => task());
+  const tail = result.catch(() => {});
+  switcherCommandChains.set(productionId, tail);
+  void tail.then(() => {
+    if (switcherCommandChains.get(productionId) === tail) {
+      switcherCommandChains.delete(productionId);
+    }
+  });
+  return result;
+}
+
 /** Exported for tests: drives one inbound message against a production. */
 export async function handleMessage(
   productionId: string,
   ws: WebSocket,
   raw: string,
-  ctx: { audioBlockId?: string; rateLimit?: RateLimitState },
+  ctx: ControllerMsgCtx,
 ): Promise<void> {
   let rawParsed: unknown;
   try {
@@ -1192,15 +1728,12 @@ export async function handleMessage(
   const msg: InboundMessage = parseResult.data as unknown as InboundMessage;
 
   // Per-connection rate limiting: drop (do not process) messages that exceed
-  // the sliding-window caps and inform the client via the standard ERROR frame.
-  if (!ctx.rateLimit) ctx.rateLimit = { general: [], expensive: [] };
+  // the sliding-window caps. Dropped messages are coalesced (one ERROR per
+  // window), logged, and — for idempotent setters — their latest value is
+  // retained and re-applied when the window drains (issue #469).
+  if (!ctx.rateLimit) ctx.rateLimit = createRateLimitState();
   if (!checkRateLimit(ctx.rateLimit, EXPENSIVE_MESSAGE_TYPES.has(msg.type), Date.now())) {
-    const rateLimitError = 'Rate limit exceeded';
-    if ('cmdId' in msg && msg.cmdId) {
-      sendNack(ws, productionId, msg.cmdId, rateLimitError);
-    } else {
-      ws.send(JSON.stringify({ type: 'ERROR', error: rateLimitError }));
-    }
+    handleRateLimitedMessage(ctx, productionId, ws, msg, raw);
     return;
   }
 
@@ -1222,6 +1755,12 @@ export async function handleMessage(
     return;
   }
 
+  // Everything below reads the production doc, may call Strom, and persists the
+  // result. For switcher-mutating commands this closure runs through the
+  // per-production serialisation chain (issue #431) so commands sent close
+  // together cannot reach Strom out of order; all other command types run
+  // immediately, exactly as before.
+  const dispatch = async (): Promise<void> => {
   const db = getDb();
   let doc: ProductionDoc;
   try {
@@ -1243,8 +1782,11 @@ export async function handleMessage(
       // never fall through to a degenerate from_input === to_input take.
       const curPgmPipBgCut = pgmPipByProduction.get(productionId) ?? null;
       if (curPgmPipBgCut !== null && pgmBgOf(productionId) === msg.mixerInput) {
-        await takePipOffToBackground(productionId, doc, msg.mixerInput, curPgmPipBgCut, 'CUT');
-        if (cmdId) sendAck(ws, productionId, cmdId, 'executed');
+        if (await takePipOffToBackground(productionId, doc, msg.mixerInput, curPgmPipBgCut, 'CUT')) {
+          if (cmdId) sendAck(ws, productionId, cmdId, 'executed');
+        } else {
+          notifySwitchRejected(ws, productionId, cmdId);
+        }
         break;
       }
       if (isAlreadyOnProgram(productionId, msg.mixerInput)) {
@@ -1261,6 +1803,8 @@ export async function handleMessage(
       const fromPadCut = (curPgmPipCut !== null && tally.pgm === null)
         ? pgmBgOf(productionId)
         : tally.pgm;
+      // Snapshot before any mutation so a Strom rejection can be rolled back (#430).
+      const preSwitchCut = snapshotSwitchState(productionId);
       const newTally = { pgm: msg.mixerInput, pvw: tally.pgm };
       setTally(productionId, newTally);
       const curPvwPipCut = pvwPipByProduction.get(productionId) ?? null;
@@ -1283,12 +1827,20 @@ export async function handleMessage(
       await persistMixerMutation(productionId, 'CUT', (d) => ({ ...d, tally: newTally }));
       broadcast(productionId, { type: 'TALLY', ...buildTallyPayload(productionId, newTally, doc) });
       const cutTransitionOk = await stromTransition(doc, fromPadCut, msg.mixerInput, 'cut');
+      if (!cutTransitionOk) {
+        // Strom rejected the cut, so it never reached air: roll the tally, PiP
+        // maps and persisted doc back to the pre-switch state, re-broadcast, and
+        // tell the operator (#430).
+        await restoreSwitchState(productionId, doc, preSwitchCut);
+        notifySwitchRejected(ws, productionId, cmdId);
+        break;
+      }
       // Announce the PiP move and restore it into Strom's preview only after the
       // transition succeeded (#355) and only if the operator has not changed PVW
       // during the Strom round trip (#341): a concurrent SET_PVW / SELECT_PVW_PIP
       // has already broadcast the authoritative PVW, so a stale displacement
       // broadcast or restore must not clobber it.
-      if (cutTransitionOk && cutPipEvent
+      if (cutPipEvent
           && (pvwPipByProduction.get(productionId) ?? null) === cutPipEvent.pvwPip) {
         broadcast(productionId, { type: 'PIP_STATE', pgmPip: null, pvwPip: cutPipEvent.pvwPip, pips: pipConfigsByProduction.get(productionId) ?? [] });
         if (curPgmPipCut !== null && doc.stromFlowId && doc.mixerBlockId) {
@@ -1311,8 +1863,11 @@ export async function handleMessage(
       // on-program PiP takes the PiP off program instead of being dropped.
       const curPgmPipBgTrans = pgmPipByProduction.get(productionId) ?? null;
       if (curPgmPipBgTrans !== null && pgmBgOf(productionId) === msg.mixerInput) {
-        await takePipOffToBackground(productionId, doc, msg.mixerInput, curPgmPipBgTrans, 'TRANSITION', { transitionType: msg.transitionType, durationMs: msg.durationMs });
-        if (cmdId) sendAck(ws, productionId, cmdId, 'executed');
+        if (await takePipOffToBackground(productionId, doc, msg.mixerInput, curPgmPipBgTrans, 'TRANSITION', { transitionType: msg.transitionType, durationMs: msg.durationMs })) {
+          if (cmdId) sendAck(ws, productionId, cmdId, 'executed');
+        } else {
+          notifySwitchRejected(ws, productionId, cmdId);
+        }
         break;
       }
       if (isAlreadyOnProgram(productionId, msg.mixerInput)) {
@@ -1326,6 +1881,8 @@ export async function handleMessage(
       const fromPadTrans = (curPgmPipTrans !== null && tally.pgm === null)
         ? pgmBgOf(productionId)
         : tally.pgm;
+      // Snapshot before any mutation so a Strom rejection can be rolled back (#430).
+      const preSwitchTrans = snapshotSwitchState(productionId);
       const newTally = { pgm: msg.mixerInput, pvw: tally.pgm };
       setTally(productionId, newTally);
       const curPvwPipTrans = pvwPipByProduction.get(productionId) ?? null;
@@ -1344,9 +1901,15 @@ export async function handleMessage(
       await persistMixerMutation(productionId, 'TRANSITION', (d) => ({ ...d, tally: newTally }));
       broadcast(productionId, { type: 'TALLY', ...buildTallyPayload(productionId, newTally, doc), transitionType: msg.transitionType, durationMs: msg.durationMs });
       const transTransitionOk = await stromTransition(doc, fromPadTrans, msg.mixerInput, toStromTransition(msg.transitionType), msg.durationMs);
+      if (!transTransitionOk) {
+        // Strom rejected the transition — roll back and notify (#430).
+        await restoreSwitchState(productionId, doc, preSwitchTrans);
+        notifySwitchRejected(ws, productionId, cmdId);
+        break;
+      }
       // Announce + restore only after the transition succeeded (#355) and only if
       // PVW was not changed during the Strom round trip (#341).
-      if (transTransitionOk && transPipEvent
+      if (transPipEvent
           && (pvwPipByProduction.get(productionId) ?? null) === transPipEvent.pvwPip) {
         broadcast(productionId, { type: 'PIP_STATE', pgmPip: null, pvwPip: transPipEvent.pvwPip, pips: pipConfigsByProduction.get(productionId) ?? [] });
         if (curPgmPipTrans !== null && doc.stromFlowId && doc.mixerBlockId) {
@@ -1365,6 +1928,9 @@ export async function handleMessage(
       break;
     }
     case 'TAKE': {
+      // Snapshot before any mutation so a Strom rejection can be rolled back (#430).
+      // Taken first because the atomic-PiP block below mutates the live tally in place.
+      const preSwitchTake = snapshotSwitchState(productionId);
       const tally = getTally(productionId);
       // Atomic PiP take: pip supplied directly so no SELECT_PVW_PIP is needed,
       // avoiding the concurrent-broadcast race that puts the PiP in both PGM and PVW.
@@ -1387,13 +1953,16 @@ export async function handleMessage(
       // Read before the persist await, which another take can land during.
       const newPgmBg = pgmBgOf(productionId);
       await persistMixerMutation(productionId, 'TAKE', (d) => ({ ...d, tally: newTally }));
-      broadcast(productionId, { type: 'TALLY', ...buildTallyPayload(productionId, newTally, doc) });
+      // The transition type/duration actually sent to Strom below, surfaced on the
+      // TALLY so a controller-socket recorder can re-render the exact transition
+      // (issue #451), mirroring the TRANSITION broadcast at ~1598. Additive fields.
+      const takeTransition = toStromTransition(msg.transitionType ?? 'cut');
+      broadcast(productionId, { type: 'TALLY', ...buildTallyPayload(productionId, newTally, doc), transitionType: takeTransition, durationMs: msg.durationMs });
       // Defer the PIP_STATE displacement broadcast until the Strom round trip
       // below reports success (issue #370, same class as #355/PR #369): announcing
       // the new PiP state before Strom has accepted the transition leaves clients
       // and Strom disagreeing when Strom rejects the /transition. The persist above
       // has already committed, so a DB failure never reaches this point.
-      const takeTransition = toStromTransition(msg.transitionType ?? 'cut');
       let takeTransitionOk = true;
       if (curPvwPip !== null) {
         // PiP is on PVW → moving to PGM, over its own configured background.
@@ -1402,7 +1971,7 @@ export async function handleMessage(
             const strom = await makeStromClient();
             await strom.mixer.selectPreview(doc.stromFlowId, doc.mixerBlockId, { source: { pip: curPvwPip } });
             await strom.mixer.transition(doc.stromFlowId, doc.mixerBlockId, {
-              ...takeInputIndices(tally.pgm ?? oldPgmBg, newPgmBg),
+              ...takeInputIndices(tally.pgm ?? oldPgmBg, newPgmBg, doc.mixerInputMap),
               transition_type: takeTransition,
               ...(msg.durationMs !== undefined ? { duration_ms: msg.durationMs } : {}),
             });
@@ -1417,7 +1986,7 @@ export async function handleMessage(
           try {
             const strom = await makeStromClient();
             await strom.mixer.transition(doc.stromFlowId, doc.mixerBlockId, {
-              ...takeInputIndices(oldPgmBg, tally.pvw),
+              ...takeInputIndices(oldPgmBg, tally.pvw, doc.mixerInputMap),
               transition_type: takeTransition,
               ...(msg.durationMs !== undefined ? { duration_ms: msg.durationMs } : {}),
             });
@@ -1429,12 +1998,19 @@ export async function handleMessage(
       } else {
         takeTransitionOk = await stromTransition(doc, tally.pgm, tally.pvw, takeTransition, msg.durationMs);
       }
+      if (!takeTransitionOk) {
+        // Strom rejected the take — roll back the tally, PiP maps and persisted
+        // doc, re-broadcast, and tell the operator (#430).
+        await restoreSwitchState(productionId, doc, preSwitchTake);
+        notifySwitchRejected(ws, productionId, cmdId);
+        break;
+      }
       // Announce the take's new PiP state, and restore a displaced PGM PiP into
       // Strom's preview, only after the transition succeeded (#370/#355) and only
       // if the operator has not changed PVW during the Strom round trip (#341): a
       // concurrent SET_PVW / SELECT_PVW_PIP has already broadcast the authoritative
       // PVW, so a stale displacement broadcast or restore must not clobber it.
-      if (takeTransitionOk && (pvwPipByProduction.get(productionId) ?? null) === newPvwPip) {
+      if ((pvwPipByProduction.get(productionId) ?? null) === newPvwPip) {
         broadcast(productionId, { type: 'PIP_STATE', pgmPip: newPgmPip, pvwPip: newPvwPip, pips: pipConfigsByProduction.get(productionId) ?? [] });
         // Reverse-PiP take (PiP was on PGM, nothing waiting in PVW): put the PiP
         // back on Strom's preview so subsequent forward takes work.
@@ -1462,7 +2038,7 @@ export async function handleMessage(
       broadcast(productionId, { type: 'TALLY', ...buildTallyPayload(productionId, newTally, doc) });
       broadcast(productionId, { type: 'PIP_STATE', pgmPip: pgmPipByProduction.get(productionId) ?? null, pvwPip: null, pips: pipConfigsByProduction.get(productionId) ?? [] });
       if (doc.stromFlowId && doc.mixerBlockId) {
-        const inputIndex = padToIndex(msg.mixerInput);
+        const inputIndex = mixerInputToStromPad(msg.mixerInput, doc.mixerInputMap);
         if (inputIndex !== null) {
           try {
             const strom = await makeStromClient();
@@ -1507,9 +2083,11 @@ export async function handleMessage(
         const pips = setPipConfigSlot(productionId, msg.pip, { bg: msg.bg, zones: msg.zones, transforms });
         broadcast(productionId, { type: 'PIP_STATE', pgmPip: pgmPipByProduction.get(productionId) ?? null, pvwPip: pvwPipByProduction.get(productionId) ?? null, pips });
 
+        // In-memory + broadcast PiP state stays in STORED pad space; only the
+        // Strom write translates bg + zone sources to COMPACT pads (issue #463).
         const resp = await strom.mixer.updatePipConfig(doc.stromFlowId, doc.mixerBlockId, msg.pip, {
-          bg: msg.bg,
-          zones: msg.zones,
+          bg: msg.bg === null ? null : storedPadToStromPad(msg.bg, doc.mixerInputMap),
+          zones: remapZonesToStromPads(msg.zones, doc.mixerInputMap),
           transforms,
         });
         // Sync back Strom-clamped transforms (may differ due to clamping)
@@ -1544,7 +2122,7 @@ export async function handleMessage(
       try {
         const strom = await makeStromClient();
         const result = await strom.mixer.fadeToBlack(doc.stromFlowId, doc.mixerBlockId, { active: msg.active ?? true, duration_ms: msg.durationMs ?? 1000 });
-        broadcast(productionId, { type: 'FTB_STATE', active: result.active });
+        broadcast(productionId, { type: 'FTB_STATE', active: result.active, durationMs: msg.durationMs ?? 1000 });
       } catch (err) {
         console.warn('[controller] Strom FTB error:', err);
         ws.send(JSON.stringify({ type: 'ERROR', error: 'FTB failed' }));
@@ -1641,7 +2219,9 @@ export async function handleMessage(
             if (curPgmPipBg !== null && pgmBgOf(productionId) === mixerInput) {
               // #353: macro CUT to the background under an on-program PiP takes
               // the PiP off program instead of being silently skipped.
-              await takePipOffToBackground(productionId, currentDoc, mixerInput, curPgmPipBg, 'MACRO_EXEC:CUT');
+              if (!await takePipOffToBackground(productionId, currentDoc, mixerInput, curPgmPipBg, 'MACRO_EXEC:CUT')) {
+                throw new Error('Switch rejected by Strom');
+              }
             } else if (!isAlreadyOnProgram(productionId, mixerInput)) {
               const tally = getTally(productionId);
               const curPgmPip = pgmPipByProduction.get(productionId) ?? null;
@@ -1651,6 +2231,8 @@ export async function handleMessage(
               const fromPad = (curPgmPip !== null && tally.pgm === null)
                 ? pgmBgOf(productionId)
                 : tally.pgm;
+              // Snapshot before any mutation so a Strom rejection can be rolled back (#430).
+              const preSwitchMacroCut = snapshotSwitchState(productionId);
               const newTally = { pgm: mixerInput, pvw: tally.pgm };
               setTally(productionId, newTally);
               const curPvwPip = pvwPipByProduction.get(productionId) ?? null;
@@ -1671,9 +2253,15 @@ export async function handleMessage(
               await persistMixerMutation(productionId, 'MACRO_EXEC:CUT', (d) => ({ ...d, tally: newTally }));
               broadcast(productionId, { type: 'TALLY', ...buildTallyPayload(productionId, newTally, currentDoc) });
               const macroCutTransitionOk = await stromTransition(currentDoc, fromPad, mixerInput, 'cut');
+              if (!macroCutTransitionOk) {
+                // Strom rejected the cut — roll back and surface it as a macro
+                // action failure (the catch below reports MACRO_ERROR) (#430).
+                await restoreSwitchState(productionId, currentDoc, preSwitchMacroCut);
+                throw new Error('Switch rejected by Strom');
+              }
               // Announce + restore only after the transition succeeded (#355) and
               // only if PVW was not changed during the Strom round trip (#341).
-              if (macroCutTransitionOk && macroCutPipEvent
+              if (macroCutPipEvent
                   && (pvwPipByProduction.get(productionId) ?? null) === macroCutPipEvent.pvwPip) {
                 broadcast(productionId, { type: 'PIP_STATE', pgmPip: null, pvwPip: macroCutPipEvent.pvwPip, pips: pipConfigsByProduction.get(productionId) ?? [] });
                 if (curPgmPip !== null && currentDoc.stromFlowId && currentDoc.mixerBlockId) {
@@ -1691,13 +2279,17 @@ export async function handleMessage(
             const curPgmPipBg = pgmPipByProduction.get(productionId) ?? null;
             if (curPgmPipBg !== null && pgmBgOf(productionId) === mixerInput) {
               // #353: macro TRANSITION to the background under an on-program PiP.
-              await takePipOffToBackground(productionId, currentDoc, mixerInput, curPgmPipBg, 'MACRO_EXEC:TRANSITION', { transitionType: action.transitionType, durationMs: action.durationMs });
+              if (!await takePipOffToBackground(productionId, currentDoc, mixerInput, curPgmPipBg, 'MACRO_EXEC:TRANSITION', { transitionType: action.transitionType, durationMs: action.durationMs })) {
+                throw new Error('Switch rejected by Strom');
+              }
             } else if (!isAlreadyOnProgram(productionId, mixerInput)) {
               const tally = getTally(productionId);
               const curPgmPip = pgmPipByProduction.get(productionId) ?? null;
               const fromPad = (curPgmPip !== null && tally.pgm === null)
                 ? pgmBgOf(productionId)
                 : tally.pgm;
+              // Snapshot before any mutation so a Strom rejection can be rolled back (#430).
+              const preSwitchMacroTrans = snapshotSwitchState(productionId);
               const newTally = { pgm: mixerInput, pvw: tally.pgm };
               setTally(productionId, newTally);
               const curPvwPip = pvwPipByProduction.get(productionId) ?? null;
@@ -1718,9 +2310,15 @@ export async function handleMessage(
               await persistMixerMutation(productionId, 'MACRO_EXEC:TRANSITION', (d) => ({ ...d, tally: newTally }));
               broadcast(productionId, { type: 'TALLY', ...buildTallyPayload(productionId, newTally, currentDoc), transitionType: action.transitionType, durationMs: action.durationMs });
               const macroTransTransitionOk = await stromTransition(currentDoc, fromPad, mixerInput, toStromTransition(action.transitionType ?? 'cut'), action.durationMs);
+              if (!macroTransTransitionOk) {
+                // Strom rejected the transition — roll back and surface it as a
+                // macro action failure (the catch below reports MACRO_ERROR) (#430).
+                await restoreSwitchState(productionId, currentDoc, preSwitchMacroTrans);
+                throw new Error('Switch rejected by Strom');
+              }
               // Announce + restore only after the transition succeeded (#355) and
               // only if PVW was not changed during the Strom round trip (#341).
-              if (macroTransTransitionOk && macroTransPipEvent
+              if (macroTransPipEvent
                   && (pvwPipByProduction.get(productionId) ?? null) === macroTransPipEvent.pvwPip) {
                 broadcast(productionId, { type: 'PIP_STATE', pgmPip: null, pvwPip: macroTransPipEvent.pvwPip, pips: pipConfigsByProduction.get(productionId) ?? [] });
                 if (curPgmPip !== null && currentDoc.stromFlowId && currentDoc.mixerBlockId) {
@@ -1741,6 +2339,8 @@ export async function handleMessage(
             const curPvwPip = pvwPipByProduction.get(productionId) as number;
             const curPgmPip = pgmPipByProduction.get(productionId) ?? null;
             const oldPgmBg = pgmBgOf(productionId);
+            // Snapshot before any mutation so a Strom rejection can be rolled back (#430).
+            const preSwitchMacroPipTake = snapshotSwitchState(productionId);
             const newTally = { pgm: tally.pvw, pvw: tally.pgm };
             const newPgmPip = curPvwPip;
             const newPvwPip = curPgmPip;
@@ -1750,7 +2350,8 @@ export async function handleMessage(
             // Read before the persist await, which another take can land during.
             const newPgmBg = pgmBgOf(productionId);
             await persistMixerMutation(productionId, 'MACRO_EXEC:TAKE', (d) => ({ ...d, tally: newTally }));
-            broadcast(productionId, { type: 'TALLY', ...buildTallyPayload(productionId, newTally, currentDoc) });
+            // A macro TAKE always cuts (#451).
+            broadcast(productionId, { type: 'TALLY', ...buildTallyPayload(productionId, newTally, currentDoc), transitionType: 'cut' });
             // Defer the PIP_STATE broadcast until the Strom transition has
             // succeeded (#370/#355).
             let macroPipTakeOk = true;
@@ -1758,7 +2359,7 @@ export async function handleMessage(
               try {
                 await strom.mixer.selectPreview(currentDoc.stromFlowId, currentDoc.mixerBlockId, { source: { pip: curPvwPip } });
                 await strom.mixer.transition(currentDoc.stromFlowId, currentDoc.mixerBlockId, {
-                  ...takeInputIndices(tally.pgm ?? oldPgmBg, newPgmBg),
+                  ...takeInputIndices(tally.pgm ?? oldPgmBg, newPgmBg, currentDoc.mixerInputMap),
                   transition_type: 'cut',
                 });
               } catch (err) {
@@ -1766,8 +2367,13 @@ export async function handleMessage(
                 macroPipTakeOk = false;
               }
             }
+            if (!macroPipTakeOk) {
+              // Roll back and report it as a macro action failure (#430).
+              await restoreSwitchState(productionId, currentDoc, preSwitchMacroPipTake);
+              throw new Error('Switch rejected by Strom');
+            }
             // Only if PVW was not changed during the Strom round trip (#341).
-            if (macroPipTakeOk && (pvwPipByProduction.get(productionId) ?? null) === newPvwPip) {
+            if ((pvwPipByProduction.get(productionId) ?? null) === newPvwPip) {
               broadcast(productionId, { type: 'PIP_STATE', pgmPip: newPgmPip, pvwPip: newPvwPip, pips: pipConfigsByProduction.get(productionId) ?? [] });
             }
           } else if (action.type === 'TAKE') {
@@ -1780,6 +2386,8 @@ export async function handleMessage(
             const fromPad = (curPgmPip !== null && tally.pgm === null)
               ? pgmBgOf(productionId)
               : tally.pgm;
+            // Snapshot before any mutation so a Strom rejection can be rolled back (#430).
+            const preSwitchMacroTake = snapshotSwitchState(productionId);
             const newTally = { pgm: tally.pvw, pvw: tally.pgm };
             setTally(productionId, newTally);
             // Defer the PIP_STATE broadcast until persist and the Strom transition
@@ -1793,11 +2401,20 @@ export async function handleMessage(
               macroTakePipEvent = { pvwPip: curPgmPip };
             }
             await persistMixerMutation(productionId, 'MACRO_EXEC:TAKE', (d) => ({ ...d, tally: newTally }));
-            broadcast(productionId, { type: 'TALLY', ...buildTallyPayload(productionId, newTally, currentDoc) });
+            // A macro TAKE always cuts (no transitionType on the action), so
+            // surface 'cut' on the TALLY to match the interactive TAKE (#451)
+            // and the value sent to Strom below.
+            broadcast(productionId, { type: 'TALLY', ...buildTallyPayload(productionId, newTally, currentDoc), transitionType: 'cut' });
             const macroTakeTransitionOk = await stromTransition(currentDoc, fromPad, tally.pvw, 'cut');
+            if (!macroTakeTransitionOk) {
+              // Strom rejected the take — roll back and surface it as a macro
+              // action failure (the catch below reports MACRO_ERROR) (#430).
+              await restoreSwitchState(productionId, currentDoc, preSwitchMacroTake);
+              throw new Error('Switch rejected by Strom');
+            }
             // Announce + restore only after the transition succeeded (#370/#355) and
             // only if PVW was not changed during the Strom round trip (#341).
-            if (macroTakeTransitionOk && macroTakePipEvent
+            if (macroTakePipEvent
                 && (pvwPipByProduction.get(productionId) ?? null) === macroTakePipEvent.pvwPip) {
               broadcast(productionId, { type: 'PIP_STATE', pgmPip: null, pvwPip: macroTakePipEvent.pvwPip, pips: pipConfigsByProduction.get(productionId) ?? [] });
               if (curPgmPip !== null && currentDoc.stromFlowId && currentDoc.mixerBlockId) {
@@ -1895,11 +2512,16 @@ export async function handleMessage(
               await s.flows.updateBlockProperties(flowId, capturedAudioBlockId, {
                 properties: { [propName]: capturedValue },
               });
+              // The debounced write reached Strom: tell every client what was
+              // actually applied, so they converge on the value Strom received
+              // (not the intermediate drag steps already broadcast above).
+              broadcast(productionId, { type: 'AUDIO_STATE', elementId: capturedLogicalId, property: 'volume', value: capturedValue, applied: true });
             } catch (err) {
               console.warn('[controller] Strom audio update error:', err);
               if (err instanceof StromPropertiesRejectedError) {
                 // Put the cache and every UI back on Strom's actual level, unless a
-                // newer fader move has already replaced the refused value.
+                // newer fader move, or a deactivate, has already replaced the refused value.
+                if (latestVolumeWrite.get(debounceKey) !== writeId) return;
                 let actual = err.current[propName];
                 if (actual === undefined) {
                   actual = await makeStromClient()
@@ -2010,7 +2632,7 @@ export async function handleMessage(
             }
             break;
           }
-          muteWritesInFlight.delete(muteKey);
+          if (muteWritesInFlight.get(muteKey) === writes) muteWritesInFlight.delete(muteKey);
           let state = writes.settled;
           if (writes.overlapped || writes.unclear) {
             const read = await strom.flows.getBlockProperties(flowId, blockId)
@@ -2021,8 +2643,12 @@ export async function handleMessage(
             if (latestMuteWrite.get(muteKey) !== writes.latest) break;
           }
           if (latestMuteWrite.get(muteKey) === writes.latest) latestMuteWrite.delete(muteKey);
-          if (state) mutedSet?.add(elementId);
-          else mutedSet?.delete(elementId);
+          // Re-fetch the registry: a deactivate/reactivate while the write was
+          // stalled replaces the Set captured above (#402). A miss means the
+          // production is no longer active, so there is nothing to record.
+          const currentMutedSet = elementId === 'main' ? undefined : mutedElementsByProduction.get(productionId);
+          if (state) currentMutedSet?.add(elementId);
+          else currentMutedSet?.delete(elementId);
           const failed = refused || (failure !== undefined && state !== requested);
           if (failed && !refused) replyError(failure);
           const frame = { type: 'AUDIO_STATE', elementId, property: 'mute', value: state };
@@ -2045,6 +2671,87 @@ export async function handleMessage(
           ws.send(JSON.stringify({ type: 'AUDIO_STATE', elementId: msg.elementId, property: 'mute', value }));
         }
       }
+      break;
+    }
+    case 'AUDIO_PROC_SET': {
+      // Audio processing control (issue #527, OL-25): per-channel gain/HPF/gate/
+      // comp/EQ and main-bus comp/EQ/limiter.
+      //
+      // 1. Stage/element compatibility — limiter + main comp/EQ only on `main`;
+      //    gain/hpf/gate only on a channel. Rejected before anything reaches Strom.
+      if (!stageAllowedOnElement(msg.stage, msg.elementId)) {
+        const errText = `Audio processing: stage '${msg.stage}' is not valid on '${msg.elementId}'`;
+        if (cmdId) sendNack(ws, productionId, cmdId, errText);
+        else ws.send(JSON.stringify({ type: 'ERROR', error: errText }));
+        break;
+      }
+      // 2. Range-validate params against the Strom ranges (reject out-of-range,
+      //    no silent clamp). On failure nothing is persisted, broadcast or written.
+      const parsed = parseStageParams(msg.stage, msg.params);
+      if (!parsed.ok) {
+        const errText = `Audio processing: ${parsed.error}`;
+        if (cmdId) sendNack(ws, productionId, cmdId, errText);
+        else ws.send(JSON.stringify({ type: 'ERROR', error: errText }));
+        break;
+      }
+      const procParams: StageParams = parsed.params;
+
+      // 3. Persist on the production doc so it survives deactivate/reactivate and
+      //    is re-applied through the flow generator (including the
+      //    construction-time ch{N}_hpf_enabled). Best-effort; 409-safe.
+      const nextStore = mergeIntoStore(doc.audioProcessing, msg.elementId, msg.stage, procParams);
+      updateProductionDoc(productionId, { audioProcessing: nextStore })
+        .catch((err) => console.warn('[controller] AUDIO_PROC_SET persist error:', err));
+
+      // 4. Optimistic broadcast for UI responsiveness; the debounced Strom write
+      //    re-broadcasts with applied:true. Mirrors the fader/aux paths.
+      broadcast(productionId, { type: 'AUDIO_PROC_STATE', elementId: msg.elementId, stage: msg.stage, params: procParams });
+
+      const { live } = stageToStromProps(msg.elementId, msg.stage, procParams);
+      // Only construction-time keys changed (e.g. HPF on/off), or the production
+      // is not active: the persisted value applies on next activation.
+      if (Object.keys(live).length === 0 || !doc.stromFlowId) {
+        if (cmdId) sendAck(ws, productionId, cmdId, 'executed');
+        break;
+      }
+      // Resolve the audio mixer block id (cached on ctx for later messages).
+      if (!ctx.audioBlockId) {
+        const strom = await makeStromClient();
+        const { flow } = await strom.flows.get(doc.stromFlowId);
+        const audioBlock = (flow.blocks ?? []).find((b) => b.block_definition_id === 'builtin.mixer');
+        if (audioBlock) ctx.audioBlockId = audioBlock.id;
+      }
+      if (!ctx.audioBlockId) {
+        const errText = 'Audio processing: mixer block not found';
+        if (cmdId) sendNack(ws, productionId, cmdId, errText);
+        else ws.send(JSON.stringify({ type: 'ERROR', error: errText }));
+        break;
+      }
+      // Debounce per element:stage — one Strom block-properties PATCH per window,
+      // so a knob drag that outruns the 20 msg/s cap still lands its final value.
+      const procFlowId = doc.stromFlowId;
+      const procBlockId = ctx.audioBlockId;
+      const procElementId = msg.elementId;
+      const procStage = msg.stage;
+      const procCmdId = cmdId;
+      const procDebounceKey = `${productionId}:proc:${msg.elementId}:${msg.stage}`;
+      const prevProc = pendingVolume.get(procDebounceKey);
+      if (prevProc) clearTimeout(prevProc);
+      pendingVolume.set(procDebounceKey, setTimeout(async () => {
+        pendingVolume.delete(procDebounceKey);
+        try {
+          const s = await makeStromClient();
+          await s.flows.updateBlockProperties(procFlowId, procBlockId, { properties: live });
+          // The write reached Strom (applied:true) — tell every operator.
+          broadcast(productionId, { type: 'AUDIO_PROC_STATE', elementId: procElementId, stage: procStage, params: procParams, applied: true });
+          if (procCmdId) sendAck(ws, productionId, procCmdId, 'executed');
+        } catch (err) {
+          console.warn('[controller] AUDIO_PROC_SET Strom error:', err);
+          const errText = `Audio processing: ${stromErrorMessage(err)}`;
+          if (procCmdId) sendNack(ws, productionId, procCmdId, errText);
+          else ws.send(JSON.stringify({ type: 'ERROR', error: errText }));
+        }
+      }, 150));
       break;
     }
     case 'AFV_SET': {
@@ -2188,6 +2895,8 @@ export async function handleMessage(
             await s.flows.updateBlockProperties(flowId, capturedAudioBlockId, {
               properties: { [`ch${chNum}_aux${capturedAuxBus}_level`]: stromValue },
             });
+            // Confirm to all clients what reached Strom (the debounced final value).
+            broadcast(productionId, { type: 'AUX_SEND_STATE', elementId: msg.elementId, auxBus: msg.auxBus, level: msg.level, enabled: msg.enabled, ...(msg.pre !== undefined && { pre: msg.pre }), applied: true });
           } catch (err) {
             console.warn('[controller] AUX_SEND_SET error:', err);
           }
@@ -2223,6 +2932,8 @@ export async function handleMessage(
                 [`aux${msg.auxBus}_fader`]: msg.muted ? 0 : msg.volume,
               },
             });
+            // Confirm to all clients what reached Strom (the debounced final value).
+            broadcast(productionId, { type: 'AUX_MASTER_STATE', auxBus: msg.auxBus, volume: msg.volume, muted: msg.muted, applied: true });
           } catch (err) {
             console.warn('[controller] AUX_MASTER_SET error:', err);
           }
@@ -2255,6 +2966,8 @@ export async function handleMessage(
             await s.flows.updateBlockProperties(flowId, capturedAudioBlockId, {
               properties: { [`ch${chIdx + 1}_to_grp${msg.grpBus}`]: msg.enabled },
             });
+            // Confirm to all clients what reached Strom (the debounced final value).
+            broadcast(productionId, { type: 'GRP_SEND_STATE', elementId: msg.elementId, grpBus: msg.grpBus, level: msg.level, enabled: msg.enabled, applied: true });
           } catch (err) {
             console.warn('[controller] GRP_SEND_SET error:', err);
           }
@@ -2293,6 +3006,8 @@ export async function handleMessage(
                 [`group${msg.grpBus}_fader`]: msg.muted ? 0 : msg.volume,
               },
             });
+            // Confirm to all clients what reached Strom (the debounced final value).
+            broadcast(productionId, { type: 'GRP_MASTER_STATE', grpBus: msg.grpBus, volume: msg.volume, muted: msg.muted, applied: true });
           } catch (err) {
             console.warn('[controller] GRP_MASTER_SET error:', err);
           }
@@ -2328,6 +3043,8 @@ export async function handleMessage(
                 monitor_fader: msg.muted ? 0 : msg.volume,
               },
             });
+            // Confirm to all clients what reached Strom (the debounced final value).
+            broadcast(productionId, { type: 'MONITOR_STATE', volume: msg.volume, muted: msg.muted, applied: true });
           } catch (err) {
             console.warn('[controller] MONITOR_SET error:', err);
           }
@@ -2371,6 +3088,8 @@ export async function handleMessage(
               property_name: 'offset_ms',
               value: offsetMs,
             });
+            // Confirm to all clients what reached Strom (the debounced final value).
+            broadcast(productionId, { type: 'SOURCE_OFFSET_STATE', mixerInput, offsetMs, applied: true });
           } catch (err) {
             console.warn(`[controller] SOURCE_OFFSET_SET error (${mixerInput}):`, String(err));
           }
@@ -2432,9 +3151,14 @@ export async function handleMessage(
       if (!doc.stromFlowId || !doc.mixerBlockId) break;
       const target = msg.target;
       const effect = msg.effect as VideoEffect;
+      // The Strom call addresses the COMPACT pad; in-memory FX state is kept in
+      // STORED pad space so FX_STATE broadcasts match the client (issue #463).
+      const stromTarget: EffectTarget = target === 'master'
+        ? 'master'
+        : { input: storedPadToStromPad(target.input, doc.mixerInputMap) };
       try {
         const strom = await makeStromClient();
-        await strom.mixer.setVideoEffect(doc.stromFlowId, doc.mixerBlockId, { target, effect });
+        await strom.mixer.setVideoEffect(doc.stromFlowId, doc.mixerBlockId, { target: stromTarget, effect });
         // Update in-memory state
         if (target === 'master') {
           masterEffectByProduction.set(productionId, effect);
@@ -2553,7 +3277,14 @@ export async function handleMessage(
         let state: ClipState;
         switch (msg.type) {
           case 'CLIP_CUE': {
-            const source = await resolveClipSource(doc, mixerInput, (sid) => getSourcesDb().get(sid) as Promise<SourceDoc>);
+            const source = await resolveCueSource(doc, mixerInput, msg.clipId, (sid) => getSourcesDb().get(sid) as Promise<SourceDoc>);
+            // On-air guard: cueing into a playing slot is refused (NACK),
+            // regardless of whether a clipId was supplied (#504 acceptance
+            // point 3). A plain Cue resolving the slot's default must be
+            // rejected too; the tracked CLIP_STATE stays intact (see the
+            // ClipSlotPlayingError branch below). The restore path (reconnect
+            // re-cue) runs on a cold registry and stays unguarded.
+            await assertSlotNotPlaying(strom, doc, mixerInput);
             // A new cue supersedes any in-flight completion poll.
             stopClipPoll(productionId, mixerInput);
             state = await cueClip(strom, doc, source, mixerInput, msg.clipId);
@@ -2602,6 +3333,8 @@ export async function handleMessage(
         }
         setClipStateEntry(productionId, state);
         broadcast(productionId, { type: 'CLIP_STATE', ...state });
+        // Acknowledge only after CLIP_STATE is recorded + broadcast (issue #499).
+        if (cmdId) sendAck(ws, productionId, cmdId, 'executed');
       } catch (err) {
         // Typed clip errors carry a human-readable message; Strom transport
         // errors are surfaced via stromErrorMessage (502/503-style text).
@@ -2610,6 +3343,7 @@ export async function handleMessage(
           err instanceof ClipNotFoundError ||
           err instanceof ClipNotActivatedError ||
           err instanceof ClipNotCuedError ||
+          err instanceof ClipSlotPlayingError ||
           err instanceof ClipMediaError
         ) {
           errText = err.message;
@@ -2617,10 +3351,15 @@ export async function handleMessage(
           errText = `Clip: ${stromErrorMessage(err)}`;
         }
         // Also record + broadcast the error transition so subscribers converge.
-        const errorState: ClipState = { mixerInput, state: 'error', error: errText };
-        setClipStateEntry(productionId, errorState);
-        broadcast(productionId, { type: 'CLIP_STATE', ...errorState });
-        ws.send(JSON.stringify({ type: 'ERROR', error: errText }));
+        // Exception: the on-air guard rejects BEFORE touching the player, so the
+        // playing clip's tracked state must stay intact (NACK/ERROR only).
+        if (!(err instanceof ClipSlotPlayingError)) {
+          const errorState: ClipState = { mixerInput, state: 'error', error: errText };
+          setClipStateEntry(productionId, errorState);
+          broadcast(productionId, { type: 'CLIP_STATE', ...errorState });
+        }
+        if (cmdId) sendNack(ws, productionId, cmdId, errText);
+        else ws.send(JSON.stringify({ type: 'ERROR', error: errText }));
       }
       break;
     }
@@ -2645,6 +3384,12 @@ export async function handleMessage(
       ws.send(JSON.stringify({ type: 'ERROR', error: 'Unknown message type' }));
     }
   }
+  };
+
+  if (SWITCHER_MESSAGE_TYPES.has(msg.type)) {
+    return runSerializedSwitcherCommand(productionId, dispatch);
+  }
+  return dispatch();
 }
 
 /**
@@ -2672,31 +3417,95 @@ export function deriveGuestDisplayState(
   return 'joined';
 }
 
+/**
+ * Watch-only connections may not send commands. Every inbound frame is
+ * answered with a NACK when it carries a cmdId, otherwise an ERROR, so a client
+ * that sends commands by mistake finds out instead of being silently ignored.
+ */
+function rejectWatchOnlyMessage(productionId: string, ws: WebSocket, raw: string): void {
+  const error = 'Watch-only connection: commands are not accepted';
+  let cmdId: unknown;
+  try {
+    cmdId = (JSON.parse(raw) as { cmdId?: unknown } | null)?.cmdId;
+  } catch { /* not JSON: plain ERROR below */ }
+  if (typeof cmdId === 'string' && cmdId) {
+    sendNack(ws, productionId, cmdId, error);
+  } else {
+    ws.send(JSON.stringify({ type: 'ERROR', error }));
+  }
+}
+
 const controllerWs: FastifyPluginAsync = async (fastify) => {
-  fastify.get<{ Params: { id: string } }>(
+  fastify.get<{ Params: { id: string }; Querystring: { mode?: string; [key: string]: unknown } }>(
     '/ws/productions/:id/controller',
     { websocket: true },
     async (socket, req) => {
       const { id } = req.params;
-      subscribe(id, socket);
-      notifySubscriberJoin(id);
+      const { mode } = req.query;
+      // Fail closed on a query key that is confusable with `mode` — a case
+      // variant (`Mode`, `MODE`) or array-bracket syntax (`mode[]`). The exact
+      // `mode` key is handled below; any genuinely unrelated param (a
+      // cache-buster, etc.) is left untouched and the connection proceeds. A
+      // passive client (e.g. a tally logger) that typo'd the key must not
+      // silently open as an operator and run first-connect audio init (#424).
+      const confusableModeKey = Object.keys(req.query).find(
+        (key) => key !== 'mode' && /^mode(\[.*\])?$/i.test(key),
+      );
+      if (confusableModeKey !== undefined) {
+        socket.send(JSON.stringify({ type: 'ERROR', error: `Ambiguous controller mode query key: ${confusableModeKey}` }));
+        socket.close(1008, 'ambiguous mode key');
+        return;
+      }
+      // Fail closed on an unknown mode: a mistyped `watch` must not fall back to
+      // an operator connection that can run first-connect audio init.
+      if (mode !== undefined && mode !== 'watch') {
+        socket.send(JSON.stringify({ type: 'ERROR', error: `Unknown controller mode: ${mode}` }));
+        socket.close(1008, 'unknown mode');
+        return;
+      }
+      // Watch-only connections receive the snapshot and broadcasts but never
+      // write: no commands, no Strom writes, no registry/cache seeding that would
+      // change what a later operator connect does, no idle-timer reset, and they
+      // are not counted as operators.
+      const watchOnly = mode === 'watch';
+      subscribe(id, socket, { watchOnly });
+      // Buffer any broadcast to this socket until its connect snapshot is
+      // complete, so live broadcasts never arrive interleaved with (and
+      // indistinguishable from) the point-to-point snapshot frames (#456).
+      // Must be before notifySubscriberJoin, which can itself broadcast.
+      beginSnapshot(socket);
+      if (!watchOnly) notifySubscriberJoin(id);
 
+      // The whole connect snapshot runs inside this try so that if a frame send
+      // or a Strom/CouchDB call throws after HELLO, the `finally` still flushes
+      // the buffered broadcasts and sends SNAPSHOT_END — otherwise the socket
+      // would stay in buffering mode and never receive another broadcast (#456).
+      try {
       // Per-connection context — mutable so the audio block ID can be populated
       // at connect time and reused on every subsequent AUDIO_SET without a flow fetch.
-      const ctx: { audioBlockId?: string; rateLimit?: RateLimitState } = {};
+      const ctx: ControllerMsgCtx = {};
 
       // Register message/close handlers immediately so no messages are dropped
       // while we perform the async connect-time sync below.
       socket.on('message', (raw: Buffer | string) => {
+        if (watchOnly) {
+          rejectWatchOnlyMessage(id, socket, raw.toString());
+          return;
+        }
         handleMessage(id, socket, raw.toString(), ctx).catch((err) => {
           console.error('[controller] unhandled message error:', err);
         });
       });
 
+      let socketClosed = false;
       socket.on('close', () => {
+        socketClosed = true;
         unsubscribe(id, socket);
-        stopMeterRelay(id);
-        stopClipRelay(id);
+        // Relays are ref-counted, so only release what this socket holds.
+        const hold = relayHolds.get(socket);
+        // A meter hold on a relay that was force-stopped since releases nothing.
+        if (hold?.meter !== undefined) stopMeterRelay(id, hold.meter);
+        if (hold?.clip) stopClipRelay(id);
         // Audio state registries are kept in memory so other connected clients
         // and future reconnects inherit the current AFV/mute configuration.
         // State is only wiped when the pipeline changes (new stromFlowId).
@@ -2712,7 +3521,7 @@ const controllerWs: FastifyPluginAsync = async (fastify) => {
       // If the pipeline changed while a client stayed connected across the restart,
       // stale channel-index registries would apply mutes/AFV to the wrong channels.
       // Wipe immediately so this connect is treated as a fresh start.
-      if (connectDoc?.stromFlowId) {
+      if (connectDoc?.stromFlowId && !watchOnly) {
         const lastFlowId = activeFlowIdByProduction.get(id)
         if (lastFlowId && lastFlowId !== connectDoc.stromFlowId) {
           clearAudioState(id)
@@ -2792,18 +3601,44 @@ const controllerWs: FastifyPluginAsync = async (fastify) => {
         }
       }
 
+      // Replay the current WHIP live-ingest state for this production's assigned
+      // sources, so a freshly-connected controller immediately knows which WHIP
+      // publishers are sending (issue #439, interim — parent #437). Only sources
+      // with a recorded state (offer/teardown already observed) are emitted; the
+      // state is in-memory only and resets on server restart. KNOWN INTERIM
+      // LIMITATION: a `connected` here may be stale if a publisher dropped
+      // without sending DELETE — see `src/services/whip-ingest-state.ts`.
+      if (connectDoc) {
+        for (const assignment of connectDoc.sources) {
+          const liveIngest = getWhipIngestState(assignment.sourceId);
+          if (liveIngest) {
+            socket.send(JSON.stringify({
+              type: 'SOURCE_INGEST_STATE',
+              sourceId: assignment.sourceId,
+              state: liveIngest.state,
+              changedAt: liveIngest.changedAt,
+            }));
+          }
+        }
+      }
+
       // Sync PiP state from in-memory server cache (populated by SET_PIP / SELECT_PVW_PIP).
       // If the cache is cold (fresh connect after deactivate or server restart),
       // hydrate it from the persisted pipConfigs on the ProductionDoc (issue #177)
       // so the operator's PiP layout is restored. If nothing was persisted, seed
       // empty slots from num_pips so the PipPanel shows the correct number of slots
       // without requiring a SET_PIP first.
-      const restoredPipConfigs = connectDoc ? hydratePipConfigsFromDoc(connectDoc) : null;
+      // A watcher reads the doc's layout without caching it: a warm cache would
+      // make the next operator connect skip the Strom re-push below.
+      const restoredPipConfigs = connectDoc && !watchOnly ? hydratePipConfigsFromDoc(connectDoc) : null;
+      const watcherPips = watchOnly && connectDoc && !pipConfigsByProduction.has(id)
+        ? pipConfigsFromDoc(connectDoc).configs
+        : null;
       socket.send(JSON.stringify({
         type: 'PIP_STATE',
         pgmPip: pgmPipByProduction.get(id) ?? null,
         pvwPip: pvwPipByProduction.get(id) ?? null,
-        pips:   pipConfigsByProduction.get(id) ?? [],
+        pips:   pipConfigsByProduction.get(id) ?? watcherPips ?? [],
       }));
 
       // On the first connect after (re)activation, Strom's PiP slots start empty
@@ -2819,8 +3654,10 @@ const controllerWs: FastifyPluginAsync = async (fastify) => {
             // Skip empty slots — nothing to restore.
             if (!cfg || (cfg.bg === null && cfg.zones.length === 0)) continue;
             await strom.mixer.updatePipConfig(flowId, mixerBlockId, i, {
-              bg: cfg.bg,
-              zones: cfg.zones,
+              // Persisted PiP layout is in STORED pad space — translate to COMPACT
+              // Strom pads for the re-push (issue #463).
+              bg: cfg.bg === null ? null : storedPadToStromPad(cfg.bg, connectDoc.mixerInputMap),
+              zones: remapZonesToStromPads(cfg.zones, connectDoc.mixerInputMap),
               transforms: cfg.transforms,
             }).catch((err) => console.warn('[controller] restore pipConfig error:', err));
           }
@@ -2842,6 +3679,12 @@ const controllerWs: FastifyPluginAsync = async (fastify) => {
           const strom = await makeStromClient();
           const { flow } = await strom.flows.get(connectDoc.stromFlowId);
           const blocks = flow.blocks ?? [];
+          // Current guest-seat health, so a reconnecting studio sees a failure
+          // that is still going on. Live changes come through the meter relay.
+          const guestBlocks = guestInputBlocks(connectDoc);
+          for (const message of guestHealthSnapshot(guestBlocks, flow.block_health)) {
+            socket.send(JSON.stringify({ ...message, seq: nextSeq(id), ts: new Date().toISOString() }));
+          }
           // Prefer the persisted audioMixerBlockId; fall back to scanning live flow blocks
           const audioBlockId = connectDoc.audioMixerBlockId ?? blocks.find((b) => b.block_definition_id === 'builtin.mixer')?.id;
           const mixerBlock = audioBlockId ? blocks.find((b) => b.id === audioBlockId) : undefined;
@@ -2851,10 +3694,11 @@ const controllerWs: FastifyPluginAsync = async (fastify) => {
             const numChannels = typeof rawNumCh === 'number' ? rawNumCh
               : typeof rawNumCh === 'string' ? parseInt(rawNumCh, 10)
               : 0;
-            numAudioChannelsByProduction.set(id, numChannels);
+            if (!watchOnly) numAudioChannelsByProduction.set(id, numChannels);
             // Only initialise registries on first connect for this production.
             // Subsequent connects (refresh, second operator) inherit existing state.
-            const isFirstConnect = !afvChannelsByProduction.has(id);
+            // A watcher never initialises; the first operator connect does.
+            const isFirstConnect = !watchOnly && !afvChannelsByProduction.has(id);
             if (isFirstConnect) {
               afvChannelsByProduction.set(id, new Set());
               mutedElementsByProduction.set(id, new Set());
@@ -2884,26 +3728,47 @@ const controllerWs: FastifyPluginAsync = async (fastify) => {
                 }
                 mutedElementsByProduction.set(id, initMuted);
               };
-              await strom.flows.updateBlockProperties(connectDoc.stromFlowId!, audioBlockId, { properties: initProps })
-                .then((res) => seedMutes(res.rejected ?? {}, res.properties ?? {}))
+              const applied = await strom.flows.updateBlockProperties(connectDoc.stromFlowId!, audioBlockId, { properties: initProps })
+                .then((res) => { seedMutes(res.rejected ?? {}, res.properties ?? {}); return true; })
                 .catch((err) => {
                   console.warn('[controller] init channel props error:', err);
                   // Keys are independent, so keep what applied; forget a refused fader's
                   // unity level so the restore below reports Strom's value instead.
-                  if (!(err instanceof StromPropertiesRejectedError)) return;
+                  if (!(err instanceof StromPropertiesRejectedError)) return false;
                   for (const key of Object.keys(err.rejected)) {
                     const fader = /^(ch\d+|main)_fader$/.exec(key);
                     if (fader) levelCache.delete(fader[1]);
                   }
                   seedMutes(err.rejected, err.current);
+                  return true;
                 });
+              // Watchers that connected first were shown Strom's pre-reset values.
+              // Skipped when the write failed outright: Strom still holds those values.
+              if (applied) broadcastAudioReset(id, numChannels, mutedElementsByProduction.get(id) ?? new Set<string>());
+              // Re-apply persisted audio processing (issue #527, OL-25) to the
+              // running flow. The connect-time init above only resets
+              // fader/mute/to_main — it NEVER touches processing keys, so this
+              // RESTORES rather than clears them. Live keys only; the
+              // construction-time ch{N}_hpf_enabled is applied by the flow
+              // generator at build and would be refused on a running pipeline.
+              const procLiveProps = liveStromPropsFromStore(connectDoc.audioProcessing);
+              if (Object.keys(procLiveProps).length > 0) {
+                await strom.flows.updateBlockProperties(connectDoc.stromFlowId!, audioBlockId, { properties: procLiveProps })
+                  .catch((err) => console.warn('[controller] connect audio-processing re-apply error:', err));
+              }
+            }
+            // Replay the current (non-default) audio processing state to THIS
+            // socket so a client that connects after the changes restores every
+            // set stage without sending anything (issue #527 §scope 2).
+            for (const { elementId, stage, params } of allStoredStages(connectDoc.audioProcessing)) {
+              socket.send(JSON.stringify({ type: 'AUDIO_PROC_STATE', elementId, stage, params }));
             }
             // Restore fader levels and mute state.
             // Server-side cache (channelLevelsByProduction) is authoritative — it is updated
             // on every AUDIO_SET volume and survives page refreshes / new tabs within the
             // same server session. Strom block properties are used as a fallback for
             // values set before the server started (e.g. pipeline defaults).
-            const mutedSet = mutedElementsByProduction.get(id) ?? new Set<string>();
+            const mutedSet = mutedElementsByProduction.get(id);
             const levelCache = channelLevelsByProduction.get(id);
             const blockProps = await strom.flows.getBlockProperties(connectDoc.stromFlowId, audioBlockId).catch(() => null);
             for (let i = 1; i <= numChannels; i++) {
@@ -2913,7 +3778,10 @@ const controllerWs: FastifyPluginAsync = async (fastify) => {
               if (volume !== undefined) {
                 socket.send(JSON.stringify({ type: 'AUDIO_STATE', elementId: `ch${i}`, property: 'volume', value: volume }));
               }
-              const isMuted = mutedSet.has(`ch${i}`);
+              // No registry yet (only a watcher has connected): report Strom's routing.
+              const isMuted = mutedSet
+                ? mutedSet.has(`ch${i}`)
+                : blockProps?.properties[`ch${i}_to_main`] === false;
               socket.send(JSON.stringify({ type: 'AUDIO_STATE', elementId: `ch${i}`, property: 'mute', value: isMuted }));
             }
             // Restore main fader level
@@ -2922,6 +3790,11 @@ const controllerWs: FastifyPluginAsync = async (fastify) => {
             const mainVolume = cachedMain ?? (typeof stromMain === 'number' ? stromMain : undefined);
             if (mainVolume !== undefined) {
               socket.send(JSON.stringify({ type: 'AUDIO_STATE', elementId: 'main', property: 'volume', value: mainVolume }));
+            }
+            // Main mute is not cached or reset by the init; Strom holds it.
+            const mainMuted = blockProps ? stromMuteState('main', blockProps.properties) : undefined;
+            if (mainMuted !== undefined) {
+              socket.send(JSON.stringify({ type: 'AUDIO_STATE', elementId: 'main', property: 'mute', value: mainMuted }));
             }
             // Restore AUX master state — prefer in-memory cache (set by this session's
             // AUX_MASTER_SET messages), fall back to Strom block properties for the first
@@ -3037,7 +3910,13 @@ const controllerWs: FastifyPluginAsync = async (fastify) => {
                 fxAvailableByProduction.set(id, mixerState.fx_available);
               }
               if (Array.isArray(mixerState.input_effects)) {
-                inputEffectsByProduction.set(id, mixerState.input_effects);
+                // Strom reports input_effects indexed by COMPACT pad; store in
+                // STORED pad space so FX_STATE matches the client (issue #463).
+                inputEffectsByProduction.set(
+                  id,
+                  expandToStoredPadIndex(mixerState.input_effects, connectDoc.mixerInputMap)
+                    .map((e) => e ?? { type: 'none' }),
+                );
               }
               if (mixerState.master_effect) {
                 masterEffectByProduction.set(id, mixerState.master_effect);
@@ -3052,7 +3931,13 @@ const controllerWs: FastifyPluginAsync = async (fastify) => {
               inputEffects: inputEffectsByProduction.get(id) ?? [],
               masterEffect: masterEffectByProduction.get(id) ?? { type: 'none' },
             }));
-            startMeterRelay(id, connectDoc.stromFlowId, audioBlockId, connectDoc.loudnessMainBlockId);
+            // Watchers hold a meter ref too: subscribing to Strom's meters writes
+            // nothing. A socket that closed during the connect sync must not take
+            // a ref it never releases, and one already holding a ref (set by
+            // re-init) must not take a second.
+            if (!socketClosed && relayHold(socket).meter === undefined) {
+              relayHold(socket).meter = startMeterRelay(id, connectDoc.stromFlowId, audioBlockId, connectDoc.loudnessMainBlockId, guestBlocks);
+            }
           }
         } catch (err) {
           console.warn('[controller] audio sync error:', err);
@@ -3110,22 +3995,25 @@ const controllerWs: FastifyPluginAsync = async (fastify) => {
           }
           // Cold registry: prefer restoring a persisted cue (OQ3) before falling
           // back to Strom's live state. A restored cue is put back into `cued` at
-          // the cue point and MUST NOT auto-play.
+          // the cue point and MUST NOT auto-play. A watcher leaves the re-cue
+          // (a Strom write) to the next operator connect.
           const persistedCue = connectDoc.clipCues?.[mixerInput];
-          if (persistedCue) {
+          if (persistedCue && !watchOnly) {
             try {
               if (!clipStrom) clipStrom = await makeStromClient();
-              const source = await resolveClipSource(connectDoc, mixerInput, (sid) => getSourcesDb().get(sid) as Promise<SourceDoc>);
+              // Re-cue the persisted source (falls back to the assigned default
+              // if it was deleted); state/persistence follow the loaded clip.
+              const source = await resolvePersistedCueSource(connectDoc, mixerInput, persistedCue.clipId, (sid) => getSourcesDb().get(sid) as Promise<SourceDoc>);
               // Re-cue Strom (setPlaylist + goto) so the player is actually ready
               // at the cue point, then seek to a non-zero cue position if any.
-              await cueClip(clipStrom, connectDoc, source, mixerInput, persistedCue.clipId);
+              await cueClip(clipStrom, connectDoc, source, mixerInput, source._id);
               if (persistedCue.positionMs && persistedCue.positionMs > 0) {
                 await clipStrom.player.seek(connectDoc.stromFlowId!, resolveClipTarget(connectDoc, mixerInput).blockId, { position_ns: persistedCue.positionMs * 1e6 });
               }
               const state: ClipState = {
                 mixerInput,
                 state: 'cued',
-                clipId: persistedCue.clipId,
+                clipId: source._id,
                 ...(persistedCue.positionMs !== undefined ? { positionMs: persistedCue.positionMs } : {}),
                 ...(persistedCue.durationMs !== undefined ? { durationMs: persistedCue.durationMs } : {}),
               };
@@ -3149,7 +4037,8 @@ const controllerWs: FastifyPluginAsync = async (fastify) => {
               ...(player.position_ns !== undefined ? { positionMs: Math.round(player.position_ns / 1e6) } : {}),
               ...(player.duration_ns !== undefined ? { durationMs: Math.round(player.duration_ns / 1e6) } : {}),
             };
-            setClipStateEntry(id, state);
+            // Not cached for a watcher: a warm registry would skip the operator's cue restore.
+            if (!watchOnly) setClipStateEntry(id, state);
             socket.send(JSON.stringify({ type: 'CLIP_STATE', ...state }));
           } catch (err) {
             console.warn(`[controller] clip state connect sync error (${mixerInput}):`, String(err));
@@ -3159,12 +4048,17 @@ const controllerWs: FastifyPluginAsync = async (fastify) => {
         // Start the reactive clip-relay for this production's clip player blocks
         // (OQ2). blockToInput is the inverse of clipPlayerBlockIds. Ref-counted:
         // one WS per production, stopped on the last controller disconnect.
-        if (connectDoc.stromFlowId) {
+        // The relay writes the registry, so a watcher does not start it.
+        if (
+          connectDoc.stromFlowId && !watchOnly && !socketClosed
+          && relayHold(socket).clip === undefined
+        ) {
           const blockToInput = new Map<string, string>();
           for (const [mixerInput, blockId] of Object.entries(connectDoc.clipPlayerBlockIds)) {
             blockToInput.set(blockId, mixerInput);
           }
           startClipRelay(id, connectDoc.stromFlowId, blockToInput);
+          relayHold(socket).clip = connectDoc.stromFlowId;
         }
       }
 
@@ -3228,17 +4122,25 @@ const controllerWs: FastifyPluginAsync = async (fastify) => {
         }
       }
 
-      // -----------------------------------------------------------------------
-      // Automation contract §4: SNAPSHOT_END (spec §4).
-      // Signals to reconnecting automation clients that the resync is complete.
-      // seq echoes the last event seq emitted during this snapshot so the client
-      // can resume applying live broadcast events with seq > snapshotEnd.seq.
-      // -----------------------------------------------------------------------
-      socket.send(JSON.stringify({
-        type: 'SNAPSHOT_END',
-        seq: currentSeq(id),
-        ts: new Date().toISOString(),
-      }));
+      } finally {
+        // Flush broadcasts that landed during the snapshot (in order), then send
+        // SNAPSHOT_END. endSnapshot() must run with no `await` before the
+        // SNAPSHOT_END send so a later broadcast cannot overtake it (#456).
+        endSnapshot(socket);
+        // -----------------------------------------------------------------------
+        // Automation contract §4: SNAPSHOT_END (spec §4).
+        // Signals to reconnecting automation clients that the resync is complete.
+        // seq echoes the last event seq emitted during this snapshot so the client
+        // can resume applying live broadcast events with seq > snapshotEnd.seq.
+        // -----------------------------------------------------------------------
+        if (socket.readyState === socket.OPEN) {
+          socket.send(JSON.stringify({
+            type: 'SNAPSHOT_END',
+            seq: currentSeq(id),
+            ts: new Date().toISOString(),
+          }));
+        }
+      }
     }
   );
 };

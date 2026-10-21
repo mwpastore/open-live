@@ -36,6 +36,8 @@ vi.mock('../ws/controller.js', () => ({
   clearPipState: vi.fn(),
   clearFxState: vi.fn(),
   clearClipStateForProduction: vi.fn(),
+  // A successful activation re-inits controllers that stayed connected.
+  reinitConnectedControllers: vi.fn(),
 }));
 
 // ---------------------------------------------------------------------------
@@ -135,11 +137,13 @@ function makeActivationResult(flowId: string, mixerBlockId: string) {
     whepOutputEntries: [],
     pgmWhepEndpointId: undefined,
     warnings: [],
+    inputRecorders: [],
     sourceOffsetBlockIds: {},
     sourceAudioOffsetBlockIds: {},
     clipPlayerBlockIds: {},
     returnBuses: [],
     returnWhepEntries: [],
+    mixerInputMap: {},
     fastWhepEntries: [] as Array<{ mixerInput: string; endpointId: string }>,
     fastFeedRouter: undefined as undefined | { flowId: string; blockId: string },
   };
@@ -203,6 +207,35 @@ describe('POST /api/v1/productions/:id/activate', () => {
     });
     const saved = mockInsert.mock.calls.map((c) => c[0] as Record<string, unknown>);
     expect(saved.some((d) => d['stromFlowId'] === 'flow-abc' && (d['activationWarnings'] as unknown[])?.length === 1)).toBe(true);
+    await app.close();
+  });
+
+  it('persists both activation-warning variants and sends each message as an ERROR frame (#516)', async () => {
+    const audioWarning = {
+      type: 'audio-stream-not-applied',
+      sourceId: 'src-cam-1',
+      mixerInput: 'video_in_3',
+      requestedIndex: 1,
+      appliedIndex: 0,
+      reason: 'strom-capability-missing',
+      message: 'Cam 1 (SRT): audio stream 2 was not applied, using stream 1. This Strom cannot select an audio stream by PID yet.',
+    };
+    const doc = makeProductionDoc();
+    mockGet.mockResolvedValue(doc);
+    mockInsert.mockResolvedValue({ rev: '2-bcd', ok: true, id: doc._id });
+    mockActivateStromFlow.mockResolvedValue({ ...activationResultWithWarning(), warnings: [noAudioWarning, audioWarning] });
+    mockStromFlowsGet.mockResolvedValue({ flow: { id: 'flow-abc', running: true, blocks: [] } });
+
+    const app = await buildServer();
+    await app.inject({ method: 'POST', url: '/api/v1/productions/prod-test-1/activate' });
+
+    await vi.waitFor(() => {
+      expect(mockBroadcast).toHaveBeenCalledWith('prod-test-1', { type: 'ERROR', error: audioWarning.message });
+    });
+    expect(mockBroadcast).toHaveBeenCalledWith('prod-test-1', { type: 'ERROR', error: noAudioWarning.message });
+    const saved = mockInsert.mock.calls.map((c) => c[0] as Record<string, unknown>);
+    const live = saved.find((d) => d['stromFlowId'] === 'flow-abc' && d['activationWarnings']);
+    expect(live?.['activationWarnings']).toEqual([noAudioWarning, audioWarning]);
     await app.close();
   });
 
@@ -344,10 +377,9 @@ describe('POST /api/v1/productions/:id/deactivate', () => {
 
     expect(res.statusCode).toBe(200);
     const body = JSON.parse(res.body);
-    // An explicit deactivate is a clean, operator-initiated teardown and always
-    // returns to `inactive` (issue #385). `ended` is reserved for the
-    // idle-watchdog auto-deactivate and reconcile flow-lost stop paths.
-    expect(body.status).toBe('inactive');
+    // Deactivating an *active* production now yields `ended` (issue #255): it ran
+    // a broadcast that has finished, distinct from a never-started `inactive`.
+    expect(body.status).toBe('ended');
 
     // Verify the doc written to CouchDB cleared the fields
     const insertedDoc = mockInsert.mock.calls[0][0];

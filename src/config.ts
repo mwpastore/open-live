@@ -3,6 +3,7 @@
 // time — `isGuestCallingEnabled()` only calls `isGuestSigningKeyAvailable()` at
 // runtime, by which point every module in the cycle is fully initialised.
 import { isGuestSigningKeyAvailable } from './lib/guest-signing-key.js';
+import { PLATFORM_DEFAULT_METERING_ENABLED, resolveGpuMetering } from './lib/gpu-metering-defaults.js';
 
 function requireEnv(name: string): string {
   const value = process.env[name];
@@ -86,10 +87,53 @@ export function buildCouchdbUrl(): string {
   return url.toString();
 }
 
+/**
+ * Parse `STROM_PUBLIC_URL`, trailing slashes removed. It is the base of the
+ * WHEP URLs given to browsers, so it must be an absolute http(s) URL: without
+ * a scheme (`strom.example.com`) the stored links would be relative.
+ */
+export function buildStromPublicUrl(): string | undefined {
+  const raw = optionalEnv('STROM_PUBLIC_URL');
+  if (!raw) return undefined;
+  // new URL() also accepts `https:host` and `https:/host`, but the raw value is what gets stored.
+  let valid = /^https?:\/\//i.test(raw);
+  if (valid) {
+    try {
+      new URL(raw);
+    } catch {
+      valid = false;
+    }
+  }
+  if (!valid) {
+    throw new Error(
+      `Invalid STROM_PUBLIC_URL: "${redactUrlCredentials(raw)}" is not an http(s) URL. ` +
+        `Expected the form http(s)://host[:port][/path].`,
+    );
+  }
+  return raw.replace(/\/+$/, '');
+}
+
+// Resolved once at import, like the rest of `config` (issue #537).
+const gpuMetering = resolveGpuMetering({
+  enabled: PLATFORM_DEFAULT_METERING_ENABLED,
+  gpuPoolEnv: optionalEnv('GPU_POOL'),
+  gpuClassEnv: optionalEnv('GPU_CLASS'),
+  oscHostname: optionalEnv('OSC_HOSTNAME'),
+  stromUrl: process.env['STROM_URL'],
+});
+
 export const config = {
   port: parseInt(process.env['PORT'] ?? '3000', 10),
   couchdbUrl: buildCouchdbUrl(),
   stromUrl: process.env['STROM_URL'] ?? 'http://localhost:7000',
+  /**
+   * Base URL browsers use to reach Strom, when it differs from `STROM_URL`
+   * (e.g. Open Live reaches Strom in-cluster, browsers through a public
+   * ingress). Used for the WHEP URLs stored on an active production
+   * (`whepEndpoint`, `pgmWhepEndpoint`, `whepOutputUrls`); the WHEP proxy maps
+   * URLs under it back to `STROM_URL` before forwarding. Unset: `STROM_URL`.
+   */
+  stromPublicUrl: buildStromPublicUrl(),
   stromToken: process.env['STROM_AUTH_TOKEN'] ?? process.env['STROM_TOKEN'] ?? undefined,
   /** 'osc' = PAT→SAT exchange via token.svc.prod.osaas.io (default for OSC-hosted Strom)
    *  'direct' = API key used as Bearer token directly (self-hosted / non-OSC Strom) */
@@ -226,8 +270,8 @@ export const config = {
   /**
    * MinIO / S3 object storage for VOD recordings (epic #5, issue #41).
    *
-   * Strom's recorder writes local files only ({media_path}/{output_dir}/{filename_prefix}_{timestamp}_%05d.{ext},
-   * backend/src/blocks/builtin/recorder.rs) — it has no native S3/MinIO sink. So open-live
+   * Strom's Live Recorder writes local files only ({media_path}/{output_dir}/{filename_prefix}_{timestamp}_%05d.{ext},
+   * backend/src/blocks/builtin/live_recorder/mod.rs) — it has no native S3/MinIO sink. So open-live
    * uploads the recorder's local segments to object storage after a production deactivates,
    * fetching them via Strom's existing media download API (`GET /api/media/file/:path`).
    *
@@ -244,6 +288,28 @@ export const config = {
   minioUseSsl: parseBoolEnv('MINIO_USE_SSL', true),
   /** Optional prefix prepended to every recording object key. */
   recordingKeyPrefix: process.env['RECORDING_KEY_PREFIX'] ?? '',
+  // --- Storage connections (issue #520, OL-21, docs/specs/storage-connections.md, ADR-009) ---
+  /**
+   * SSRF allowlist for operator-supplied storage-connection endpoints (ADR-009
+   * Decision 2, §5). Comma-separated private/loopback/link-local IP literals or
+   * CIDR ranges that a `StorageConnection` endpoint MAY resolve to, for
+   * self-hosted MinIO on a private LAN (e.g. "192.168.1.0/24,10.10.0.5"). Empty
+   * by default: every private/loopback/link-local endpoint is rejected — the
+   * safe cloud/OSC posture. Parsed with the existing `TRUSTED_HOSTS` idiom and
+   * matched by the same CIDR / IPv4-mapped-IPv6 logic
+   * (`src/lib/url-validation.ts`). Never relaxes http/graphic/SRT SSRF checks.
+   * NEVER add 169.254.0.0/16 (cloud metadata) or 0.0.0.0/0.
+   */
+  trustedStorageHosts: (process.env['TRUSTED_STORAGE_HOSTS'] ?? '')
+    .split(',')
+    .map((h) => h.trim().toLowerCase())
+    .filter(Boolean),
+  /**
+   * Server-side page-size cap for `GET /api/v1/storage-connections/:id/objects`
+   * (spec §2.8). A caller-requested `max-keys` is clamped to this. Bounds
+   * listing enumeration / cost on a huge bucket. Default 1000.
+   */
+  storageListMaxKeys: parsePositiveIntEnv('STORAGE_LIST_MAX_KEYS', 1000),
   /** Presigned playback URL TTL in seconds (used by #42's listing endpoint). */
   recordingPresignTtlS: parsePositiveIntEnv('RECORDING_PRESIGN_TTL_S', 3600),
   /**
@@ -335,6 +401,53 @@ export const config = {
    * and redacted in `src/lib/log-redact.ts`. Consumed by a later sub-issue.
    */
   intercomManagerToken: process.env['INTERCOM_MANAGER_TOKEN'] ?? undefined,
+  // --- Shared-GPU usage metering (issue #500, docs/specs/shared-gpu-usage-metering.md, ADR-005) ---
+  /**
+   * Shared-GPU pool label (e.g. `se-sto01`) surfaced as the `gpu_pool` label /
+   * `gpuPool` field. **Metering is enabled iff this is set.** Resolved by
+   * `resolveGpuMetering` (`src/lib/gpu-metering-defaults.ts`, issue #537):
+   * - an explicit `GPU_POOL` env value always wins and enables metering
+   *   anywhere (source `env`);
+   * - otherwise, when `PLATFORM_DEFAULT_METERING_ENABLED` is on, an
+   *   OSC-managed instance (`OSC_HOSTNAME`, platform-injected) whose
+   *   `STROM_URL` is the platform-hosted shared Strom gets a pool derived from
+   *   the Strom host (source `platform-default`);
+   * - otherwise unset, so self-hosted / BYO-Strom deployments report zero
+   *   shared-GPU time (`/api/v1/usage/gpu` → `hours: []`, `/metrics` emits no
+   *   `osc_gpu_*` samples).
+   * No published service option maps to `GPU_POOL`; nothing else may read
+   * `process.env.GPU_POOL`.
+   */
+  gpuPool: gpuMetering?.pool,
+  /**
+   * `gpu_class` label value (default `shared`; `GPU_CLASS` env overrides). Only
+   * the shared class is metered to tokens; a `dedicated` value can be emitted
+   * for dashboards without implying billing.
+   */
+  gpuClass: gpuMetering?.class ?? optionalEnv('GPU_CLASS') ?? 'shared',
+  /** Where `gpuPool` came from (`env` / `platform-default`); undefined when metering is off. Logged at startup. */
+  gpuMeteringSource: gpuMetering?.source,
+  /**
+   * Settle-sweep cadence in ms (default 5 min). The sweep writes each fully
+   * elapsed UTC hour's GPU-seconds into the owning production's append-only
+   * `gpuHours` buckets. A lower value bounds the worst-case partial hour lost on
+   * a hard crash between sweeps; a higher value reduces CouchDB writes.
+   */
+  gpuSettleIntervalMs: parsePositiveIntEnv('GPU_SETTLE_INTERVAL_MS', 300_000, MAX_TIMER_MS),
+  /**
+   * How long (hours, default 2160 = 90 days) closed `gpuHours` buckets are
+   * retained and returned by `/api/v1/usage/gpu`. Old buckets are pruned on
+   * settle. Must exceed the platform's re-poll + dead-letter window.
+   */
+  gpuUsageRetentionHours: parsePositiveIntEnv('GPU_USAGE_RETENTION_HOURS', 2160),
+  /**
+   * Optional OSC workspace id. When the platform injects one, it is emitted as
+   * the `tenantId` / `tenant` label. Unset (the expected case today — open-live
+   * has no tenant id of its own) → `"unattributed"`, and the platform poller
+   * resolves instance→tenant on its side. A bucket is NEVER dropped for lack of
+   * a tenant.
+   */
+  oscWorkspaceId: optionalEnv('OSC_WORKSPACE_ID'),
 } as const;
 
 /**
@@ -347,6 +460,22 @@ export const config = {
  */
 export function isGuestCallingEnabled(): boolean {
   return isGuestSigningKeyAvailable();
+}
+
+/**
+ * True when shared-GPU usage metering is enabled, i.e. `config.gpuPool` is
+ * resolved: from an explicit `GPU_POOL`, or from the platform default for an
+ * OSC-managed instance on the platform-hosted shared Strom when
+ * `PLATFORM_DEFAULT_METERING_ENABLED` is on (issue #537). When false (every
+ * self-hosted / BYO-Strom deployment, and every managed instance while the
+ * switch is off and no `GPU_POOL` is set), no GPU-seconds accrue,
+ * `/api/v1/usage/gpu` returns `hours: []`, and `/metrics` emits no `osc_gpu_*`
+ * samples. This is the single predicate for all accrual AND the zero-balance
+ * start gate (`production-gate.ts`), so the metered set and the gated set are
+ * the same by construction.
+ */
+export function isGpuMeteringEnabled(): boolean {
+  return Boolean(config.gpuPool);
 }
 
 /**

@@ -90,7 +90,8 @@ vi.mock('../db/index.js', () => ({
   getDb: () => prodDb,
   getGuestInvitesDb: () => invitesDb,
   getGuestSessionsDb: () => sessionsDb,
-  getSourcesDb: () => ({ get: vi.fn(), insert: vi.fn(), find: vi.fn(), destroy: vi.fn() }),
+  // Every slot's source is a WHIP guest.
+  getSourcesDb: () => ({ get: vi.fn(async () => ({ streamType: 'whip' })), insert: vi.fn(), find: vi.fn(), destroy: vi.fn() }),
   getOutputsDb: () => ({ get: vi.fn(), insert: vi.fn(), find: vi.fn(), destroy: vi.fn() }),
   getGatewaysDb: () => ({ get: vi.fn(), insert: vi.fn(), find: vi.fn(), destroy: vi.fn() }),
   connectDb: vi.fn().mockResolvedValue(undefined),
@@ -112,6 +113,8 @@ vi.mock('../lib/strom-token.js', () => ({
 
 const AUTH = { authorization: `Bearer ${TEST_API_KEY}` };
 const STROM_URL = 'http://localhost:7000'; // matches vitest.config.ts env STROM_URL
+
+const { applyReturnMode } = await import('../ws/controller.js');
 
 let app: FastifyInstance;
 let buildServer: typeof import('../server.js')['buildServer'];
@@ -347,6 +350,143 @@ describe('Return-picture WHEP guest-token auth (issue #380)', () => {
   });
 });
 
+describe('Guest return mode: GET / PUT /api/v1/guests/:inviteId/session/return', () => {
+  const returnUrl = (inviteId: string) => `/api/v1/guests/${inviteId}/session/return`;
+  const bearer = (token: string) => ({ authorization: `Bearer ${token}` });
+
+  beforeEach(() => {
+    vi.mocked(applyReturnMode).mockReset();
+    vi.mocked(applyReturnMode).mockImplementation(async (_productionId, mixerInput, mode) => ({
+      ok: true,
+      mixerInput,
+      mode,
+    }));
+  });
+
+  async function leaveGuest(inviteId: string, token: string) {
+    const res = await app.inject({ method: 'DELETE', url: `/api/v1/guests/${inviteId}/session`, headers: bearer(token) });
+    expect(res.statusCode).toBe(204);
+  }
+
+  it('GET reports the slot mode and the modes on offer to a live guest', async () => {
+    const doc = seedActiveProduction();
+    const invite = await createInvite('prod-1', { mixerInput: 'video_in_0' });
+    await joinGuest(invite.id, invite.token);
+    doc.sources[0]!.returnFeed = { synced: 'program' };
+    const res = await app.inject({ method: 'GET', url: returnUrl(invite.id), headers: bearer(invite.token) });
+    expect(res.statusCode).toBe(200);
+    const body = res.json() as { mixerInput: string; mode: string; modes: Array<{ key: string }>; defaultMode: string };
+    expect(body.mixerInput).toBe('video_in_0');
+    expect(body.mode).toBe('program');
+    expect(body.defaultMode).toBe('program-minus');
+    expect(body.modes.map((m) => m.key)).toEqual(['program', 'program-minus']);
+  });
+
+  it('PUT applies the mode on the guest\'s own input', async () => {
+    seedActiveProduction();
+    const invite = await createInvite('prod-1', { mixerInput: 'video_in_0' });
+    await joinGuest(invite.id, invite.token);
+    const res = await app.inject({
+      method: 'PUT',
+      url: returnUrl(invite.id),
+      headers: bearer(invite.token),
+      payload: { mode: 'program' },
+    });
+    expect(res.statusCode).toBe(200);
+    expect(res.json()).toEqual({ mixerInput: 'video_in_0', mode: 'program' });
+    expect(applyReturnMode).toHaveBeenCalledWith('prod-1', 'video_in_0', 'program');
+  });
+
+  it('401s without a token, and the shared API key is not a guest token', async () => {
+    seedActiveProduction();
+    const invite = await createInvite('prod-1', { mixerInput: 'video_in_0' });
+    await joinGuest(invite.id, invite.token);
+    for (const headers of [{}, AUTH]) {
+      const get = await app.inject({ method: 'GET', url: returnUrl(invite.id), headers });
+      expect(get.statusCode).toBe(401);
+      const put = await app.inject({ method: 'PUT', url: returnUrl(invite.id), headers, payload: { mode: 'program' } });
+      expect(put.statusCode).toBe(401);
+    }
+    expect(applyReturnMode).not.toHaveBeenCalled();
+  });
+
+  it('401s a token used under another invite\'s id', async () => {
+    seedActiveProduction();
+    const inviteA = await createInvite('prod-1', { mixerInput: 'video_in_0' });
+    const inviteB = await createInvite('prod-1', { mixerInput: 'video_in_1' });
+    await joinGuest(inviteA.id, inviteA.token);
+    await joinGuest(inviteB.id, inviteB.token);
+    const res = await app.inject({
+      method: 'PUT',
+      url: returnUrl(inviteB.id),
+      headers: bearer(inviteA.token),
+      payload: { mode: 'program' },
+    });
+    expect(res.statusCode).toBe(401);
+    expect(applyReturnMode).not.toHaveBeenCalled();
+  });
+
+  it('a guest who left cannot change the mode of the guest who now holds the slot', async () => {
+    seedActiveProduction();
+    const first = await createInvite('prod-1', { mixerInput: 'video_in_0' });
+    await joinGuest(first.id, first.token);
+    await leaveGuest(first.id, first.token);
+    const second = await createInvite('prod-1', { mixerInput: 'video_in_0' });
+    await joinGuest(second.id, second.token);
+    vi.mocked(applyReturnMode).mockClear();
+
+    const put = await app.inject({
+      method: 'PUT',
+      url: returnUrl(first.id),
+      headers: bearer(first.token),
+      payload: { mode: 'program' },
+    });
+    expect(put.statusCode).toBe(401);
+    const get = await app.inject({ method: 'GET', url: returnUrl(first.id), headers: bearer(first.token) });
+    expect(get.statusCode).toBe(401);
+    expect(applyReturnMode).not.toHaveBeenCalled();
+  });
+
+  it('401s once the guest has been kicked', async () => {
+    seedActiveProduction();
+    const invite = await createInvite('prod-1', { mixerInput: 'video_in_0' });
+    const { guestId } = await joinGuest(invite.id, invite.token);
+    const kick = await app.inject({ method: 'DELETE', url: `/api/v1/productions/prod-1/guests/${guestId}`, headers: AUTH });
+    expect(kick.statusCode).toBe(204);
+    const res = await app.inject({
+      method: 'PUT',
+      url: returnUrl(invite.id),
+      headers: bearer(invite.token),
+      payload: { mode: 'program' },
+    });
+    expect(res.statusCode).toBe(401);
+  });
+
+  it('401s an expired invite (persisted expiry)', async () => {
+    seedActiveProduction();
+    const invite = await createInvite('prod-1', { mixerInput: 'video_in_0' });
+    await joinGuest(invite.id, invite.token);
+    const stored = invitesStore.get(invite.id)!;
+    invitesStore.set(invite.id, { ...stored, expiresAt: new Date(Date.now() - 1000).toISOString() });
+    const res = await app.inject({ method: 'GET', url: returnUrl(invite.id), headers: bearer(invite.token) });
+    expect(res.statusCode).toBe(401);
+  });
+
+  it('400s low-latency-minus, which is a feed choice rather than a mix', async () => {
+    seedActiveProduction();
+    const invite = await createInvite('prod-1', { mixerInput: 'video_in_0' });
+    await joinGuest(invite.id, invite.token);
+    const res = await app.inject({
+      method: 'PUT',
+      url: returnUrl(invite.id),
+      headers: bearer(invite.token),
+      payload: { mode: 'low-latency-minus' },
+    });
+    expect(res.statusCode).toBe(400);
+    expect(applyReturnMode).not.toHaveBeenCalled();
+  });
+});
+
 describe('Fast return feed (returnFeed.lowLatency)', () => {
   function seedWithFast() {
     const doc = seedActiveProduction();
@@ -390,18 +530,50 @@ describe('Fast return feed (returnFeed.lowLatency)', () => {
   it('proxies a guest\'s fast feed to its own Strom endpoint and scopes teardown to /fast/whep', async () => {
     seedWithFast();
     const invite = await createInvite('prod-1', { mixerInput: 'video_in_0' });
-    const join = (await app.inject({
-      method: 'POST',
-      url: `/api/v1/guests/${invite.id}/join`,
-      headers: { authorization: `Bearer ${invite.token}` },
-    })).json();
-    expect(join.feeds.map((f: { id: string }) => f.id)).toEqual(['picture', 'fast']);
-
+    await joinGuest(invite.id, invite.token);
     const { res, location } = await postFast('video_in_0', { authorization: `Bearer ${invite.token}` });
     expect(res.statusCode).toBe(201);
     const calls = (fetch as unknown as { mock: { calls: unknown[][] } }).mock.calls;
     expect(calls.at(-1)![0]).toBe(`${STROM_URL}/whep/fast-video_in_0`);
     expect(location).toMatch(/^\/api\/v1\/productions\/prod-1\/returns\/video_in_0\/fast\/whep\/session-\d+$/);
+  });
+
+  it('hands a guest the fast feed under /api/v1/guests and serves it there', async () => {
+    seedWithFast();
+    const invite = await createInvite('prod-1', { mixerInput: 'video_in_0' });
+    const guest = { authorization: `Bearer ${invite.token}` };
+    const join = (await app.inject({ method: 'POST', url: `/api/v1/guests/${invite.id}/join`, headers: guest })).json();
+    const path = `/api/v1/guests/${invite.id}/returns`;
+    expect(join.feeds.map((f: { id: string; url: string; video: boolean }) => [f.id, new URL(f.url).pathname, f.video])).toEqual([
+      ['picture', `${path}/picture/whep`, true],
+      ['fast', `${path}/fast/whep`, false],
+    ]);
+    expect(join.modes.map((m: { key: string }) => m.key)).toContain('low-latency-minus');
+
+    const post = (feed: string) => app.inject({
+      method: 'POST',
+      url: `/api/v1/guests/${invite.id}/returns/${feed}/whep`,
+      headers: { ...guest, 'content-type': 'application/sdp' },
+      payload: 'v=0',
+    });
+    const fast = await post('fast');
+    expect(fast.statusCode).toBe(201);
+    const calls = (fetch as unknown as { mock: { calls: unknown[][] } }).mock.calls;
+    expect(calls.at(-1)![0]).toBe(`${STROM_URL}/whep/fast-video_in_0`);
+    const fastLocation = fast.headers['location'] as string;
+    expect(fastLocation).toMatch(new RegExp(`^/api/v1/guests/${invite.id}/returns/fast/whep/session-\\d+$`));
+    const picture = await post('picture');
+    const pictureSession = (picture.headers['location'] as string).split('/').pop();
+
+    // Each feed's session is bound on its own: the picture id does not tear down the fast feed.
+    const del = (feed: string, id: string | undefined) =>
+      app.inject({ method: 'DELETE', url: `/api/v1/guests/${invite.id}/returns/${feed}/whep/${id}`, headers: guest });
+    expect((await del('fast', pictureSession)).statusCode).toBe(403);
+    expect((await del('fast', fastLocation.split('/').pop())).statusCode).toBe(204);
+    expect((await del('picture', pictureSession)).statusCode).toBe(204);
+
+    const mode = (await app.inject({ method: 'GET', url: `/api/v1/guests/${invite.id}/session/return`, headers: guest })).json();
+    expect(mode.modes.map((m: { key: string }) => m.key)).toContain('low-latency-minus');
   });
 
   it('404s the fast feed on an input without one', async () => {

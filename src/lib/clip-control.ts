@@ -32,7 +32,8 @@ import { createHash, createHmac } from 'crypto';
 import type { StromClient, PlayerStateResponse } from './strom.js';
 import type { ClipReference, ClipState, ProductionDoc, SourceDoc } from '../db/types.js';
 import { deserializeClipReference } from './clip-reference.js';
-import { minioTargetFromConfig, type MinioTarget } from './recording-uploader.js';
+import { type MinioTarget } from './recording-uploader.js';
+import { resolveStorageTarget, StorageConnectionNotFoundError } from './storage-connection.js';
 import { httpUrlOnly } from './url-validation.js';
 import { config } from '../config.js';
 import { markClipPlayPending } from '../services/clip-state.service.js';
@@ -55,6 +56,15 @@ export class ClipNotActivatedError extends Error {
   constructor(message = 'Production is not activated') {
     super(message);
     this.name = 'ClipNotActivatedError';
+  }
+}
+
+/** Thrown when a Cue targets a slot whose player is currently playing (→ 409). */
+export class ClipSlotPlayingError extends Error {
+  readonly statusCode = 409;
+  constructor(message = 'Clip slot is playing; stop it before cueing another clip') {
+    super(message);
+    this.name = 'ClipSlotPlayingError';
   }
 }
 
@@ -156,13 +166,27 @@ function presignS3Get(target: MinioTarget, key: string, expiresS: number, now: D
  * Reference resolution is confined to `cue`; downstream play/pause/stop/seek and
  * the state machine never see the reference type (spec invariant).
  */
-export function resolveClipFile(source: SourceDoc): string {
+export async function resolveClipFile(source: SourceDoc): Promise<string> {
   const ref: ClipReference = deserializeClipReference(source.address);
   switch (ref.type) {
     case 'url':
       return ref.url;
     case 's3': {
-      const target = minioTargetFromConfig();
+      // Presign against the bucket stored on the reference (issue #505) using
+      // the reference's storage connection when it carries one (issue #520),
+      // else the env-derived default connection. Falls back to MINIO_BUCKET
+      // only when the reference carries no bucket.
+      let target: MinioTarget | null;
+      try {
+        target = await resolveStorageTarget(ref.connectionId, ref.bucket);
+      } catch (err) {
+        if (err instanceof StorageConnectionNotFoundError) {
+          // A connectionId that no longer resolves is a Cue-time error, the same
+          // place a bad bucket surfaces today (spec §2.9).
+          throw new ClipNotFoundError(err.message);
+        }
+        throw err;
+      }
       if (!target) {
         throw new ClipNotFoundError('Object storage is not configured — cannot resolve s3 clip reference');
       }
@@ -219,7 +243,10 @@ function sleep(ms: number): Promise<void> {
 const PREFLIGHT_MAX_REDIRECTS = 3;
 const PREFLIGHT_REDIRECT_STATUSES = new Set([301, 302, 303, 307, 308]);
 
-async function preflightClipUrl(url: string, timeoutMs: number): Promise<void> {
+async function preflightClipUrl(url: string, timeoutMs: number, objectLabel?: string): Promise<void> {
+  // For s3 references, name the bucket and key in failures (issue #505) so the
+  // operator can tell which object could not be read.
+  const suffix = objectLabel ? ` (${objectLabel})` : '';
   let current = url;
   for (let hop = 0; ; hop++) {
     let res: Response;
@@ -232,7 +259,7 @@ async function preflightClipUrl(url: string, timeoutMs: number): Promise<void> {
       });
     } catch (err) {
       const reason = err instanceof Error ? err.message : String(err);
-      throw new ClipMediaError(`Clip URL could not be reached: ${reason}`);
+      throw new ClipMediaError(`Clip URL could not be reached: ${reason}${suffix}`);
     }
     // Don't stream the body: a Range-ignoring origin would otherwise start
     // pulling the whole file just to satisfy a reachability check.
@@ -264,7 +291,7 @@ async function preflightClipUrl(url: string, timeoutMs: number): Promise<void> {
     }
 
     if (!res.ok) {
-      throw new ClipMediaError(`Clip URL returned HTTP ${res.status}`);
+      throw new ClipMediaError(`Clip URL returned HTTP ${res.status}${suffix}`);
     }
     return;
   }
@@ -340,8 +367,11 @@ export function mapPlayerState(
  * in Strom `stop` is pause + seek 0, i.e. exactly "parked at the first frame".
  * This also fixes the restore path (`controller.ts` re-cues a persisted cue).
  *
- * The clip source is resolved from the production's source assignments for this
- * mixer input; `clipId`, when supplied, must match the assigned source id.
+ * The caller resolves WHICH clip source to load (see {@link resolveCueSource}):
+ * the source assigned to the mixer input by default, or — when the Cue carries a
+ * `clipId` — that clip source (the slot is a player; the clip is chosen at Cue
+ * time). `clipId` here is only the label echoed in the returned ClipState and
+ * defaults to the loaded `source._id`.
  *
  * Before touching Strom, the resolved URL is preflight-checked for
  * reachability, and after `setPlaylist`/`goto`/the parking `stop` the cue
@@ -358,8 +388,10 @@ export async function cueClip(
   clipId?: string,
 ): Promise<ClipState> {
   const { flowId, blockId } = resolveClipTarget(doc, mixerInput);
-  const file = resolveClipFile(source);
-  await preflightClipUrl(file, config.clipPreflightTimeoutMs);
+  const file = await resolveClipFile(source);
+  const ref = deserializeClipReference(source.address);
+  const objectLabel = ref.type === 's3' ? `bucket "${ref.bucket || config.minioBucket}", key "${ref.key}"` : undefined;
+  await preflightClipUrl(file, config.clipPreflightTimeoutMs, objectLabel);
   await strom.player.setPlaylist(flowId, blockId, { files: [file] });
   await strom.player.goto(flowId, blockId, { index: 0 });
   // Park at frame 0: Strom's stop = pause + seek 0 (issue #350).
@@ -427,4 +459,58 @@ export async function resolveClipSource(
   }
   if (source.streamType !== 'clip') throw new ClipNotFoundError('Source is not a clip source');
   return source;
+}
+
+/**
+ * Resolves the clip source a Cue should load. Without `clipId` this is exactly
+ * {@link resolveClipSource} (the source assigned to the slot). With `clipId`,
+ * `clipId` is a clip SOURCE id: it must exist and be `streamType: 'clip'`, else
+ * {@link ClipNotFoundError} (404). The slot itself (player block) must still
+ * exist — checked by `cueClip` via {@link resolveClipTarget}.
+ */
+export async function resolveCueSource(
+  doc: ProductionDoc,
+  mixerInput: string,
+  clipId: string | undefined,
+  loadSource: (sourceId: string) => Promise<SourceDoc>,
+): Promise<SourceDoc> {
+  if (clipId === undefined) return resolveClipSource(doc, mixerInput, loadSource);
+  let source: SourceDoc;
+  try {
+    source = await loadSource(clipId);
+  } catch {
+    throw new ClipNotFoundError(`Clip source "${clipId}" not found`);
+  }
+  if (source.streamType !== 'clip') throw new ClipNotFoundError(`Source "${clipId}" is not a clip source`);
+  return source;
+}
+
+/**
+ * Restore-path variant: re-cue the persisted source; if it was deleted (or is
+ * no longer a clip source) fall back to the slot's assigned default.
+ */
+export async function resolvePersistedCueSource(
+  doc: ProductionDoc,
+  mixerInput: string,
+  persistedClipId: string | undefined,
+  loadSource: (sourceId: string) => Promise<SourceDoc>,
+): Promise<SourceDoc> {
+  if (persistedClipId !== undefined) {
+    try {
+      return await resolveCueSource(doc, mixerInput, persistedClipId, loadSource);
+    } catch (err) {
+      if (!(err instanceof ClipNotFoundError)) throw err;
+    }
+  }
+  return resolveClipSource(doc, mixerInput, loadSource);
+}
+
+/**
+ * On-air guard for change-clip Cues: throws {@link ClipSlotPlayingError} (409)
+ * when the slot's player is currently `playing`. The operator must Stop first.
+ */
+export async function assertSlotNotPlaying(strom: StromClient, doc: ProductionDoc, mixerInput: string): Promise<void> {
+  const { flowId, blockId } = resolveClipTarget(doc, mixerInput);
+  const player = await strom.player.getState(flowId, blockId);
+  if (player.state === 'playing') throw new ClipSlotPlayingError();
 }

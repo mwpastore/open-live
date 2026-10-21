@@ -266,3 +266,52 @@ describe('raw Strom frame through connectWebSocket -> clip-relay', () => {
     expect(clipStates().at(-1)).toMatchObject({ state: 'playing', positionMs: 3000, durationMs: 8000 });
   });
 });
+
+// A relay left on the torn-down flow (started by a connect mid-deactivate) is
+// rebound by the next start; a late start with the torn-down flow does not pull
+// a relay off the new flow.
+describe('deactivate→reactivate flow rebind (issue #416)', () => {
+  const OLD_FLOW = 'flow-old';
+  const NEW_FLOW = 'flow-new';
+  const BLOCK = 'mediaplayer-1';
+
+  beforeEach(() => {
+    wsHandlers.clear();
+    forceStopClipRelay(PROD, 'flow-none');
+  });
+
+  it('a relay started on the torn-down flow is rebound by the next start', async () => {
+    forceStopClipRelay(PROD, OLD_FLOW);
+    startClipRelay(PROD, OLD_FLOW, new Map([[BLOCK, INPUT]]));
+    await Promise.resolve(); await Promise.resolve();
+
+    startClipRelay(PROD, NEW_FLOW, new Map([[BLOCK, INPUT]]));
+    setClipStateEntry(PROD, { mixerInput: INPUT, state: 'playing', clipId: 'c1' });
+    pushRawFrame(JSON.stringify({ type: 'MediaPlayerStateChanged', data: { flow_id: OLD_FLOW, block_id: BLOCK, state: 'paused' } }));
+    expect(clipStates()).toHaveLength(0);
+    pushRawFrame(JSON.stringify({ type: 'MediaPlayerStateChanged', data: { flow_id: NEW_FLOW, block_id: BLOCK, state: 'paused' } }));
+    expect(clipStates().at(-1)).toMatchObject({ mixerInput: INPUT, state: 'paused' });
+  });
+
+  it('a late start with the torn-down flow does not pull the relay off the new flow', async () => {
+    const NEW_BLOCK = 'mediaplayer-2';
+    forceStopClipRelay(PROD, OLD_FLOW);
+    startClipRelay(PROD, NEW_FLOW, new Map([[NEW_BLOCK, INPUT]]));
+    await Promise.resolve(); await Promise.resolve();
+    startClipRelay(PROD, OLD_FLOW, new Map([[BLOCK, INPUT]]));
+
+    setClipStateEntry(PROD, { mixerInput: INPUT, state: 'playing', clipId: 'c1' });
+    pushRawFrame(JSON.stringify({ type: 'MediaPlayerStateChanged', data: { flow_id: NEW_FLOW, block_id: NEW_BLOCK, state: 'paused' } }));
+    expect(clipStates().at(-1)).toMatchObject({ mixerInput: INPUT, state: 'paused' });
+  });
+
+  it('forceStop + restart binds to the new flow', async () => {
+    startClipRelay(PROD, OLD_FLOW, new Map([[BLOCK, INPUT]]));
+    forceStopClipRelay(PROD);
+    startClipRelay(PROD, NEW_FLOW, new Map([[BLOCK, INPUT]]));
+    await Promise.resolve(); await Promise.resolve();
+    setClipStateEntry(PROD, { mixerInput: INPUT, state: 'playing', clipId: 'c1' });
+    pushRawFrame(JSON.stringify({ type: 'MediaPlayerStateChanged', data: { flow_id: NEW_FLOW, block_id: BLOCK, state: 'paused' } }));
+    expect(clipStates().at(-1)).toMatchObject({ mixerInput: INPUT, state: 'paused' });
+  });
+});

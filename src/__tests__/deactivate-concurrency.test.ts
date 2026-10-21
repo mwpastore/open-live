@@ -96,7 +96,7 @@ describe('overlapping deactivates of one production', () => {
     const responses = await Promise.all([first, second, third]);
     for (const res of responses) {
       expect(res.statusCode).toBe(200);
-      expect(JSON.parse(res.body)).toEqual({ id: 'prod-test-1', name: 'Test Production', status: 'inactive', _rev: '116-def' });
+      expect(JSON.parse(res.body)).toEqual({ id: 'prod-test-1', name: 'Test Production', status: 'ended', _rev: '116-def' });
     }
     expect(mockDeactivateStromFlow).toHaveBeenCalledTimes(1);
     expect(mockInsert).toHaveBeenCalledTimes(1);
@@ -155,10 +155,11 @@ describe('revision conflict on the final write', () => {
     const res = await app.inject({ method: 'POST', url });
 
     expect(res.statusCode).toBe(200);
-    expect(JSON.parse(res.body)).toEqual({ id: 'prod-test-1', name: 'Renamed', status: 'inactive', _rev: '117-def' });
+    expect(JSON.parse(res.body)).toEqual({ id: 'prod-test-1', name: 'Renamed', status: 'ended', _rev: '117-def' });
     const retried = mockInsert.mock.calls[1][0];
     expect(retried._rev).toBe('116-tally');
-    expect(retried.status).toBe('inactive');
+    expect(retried.status).toBe('ended');
+    expect(retried.endedReason).toBe('deactivated');
     expect(retried.stromFlowId).toBeUndefined();
     expect(retried.tally).toEqual({ pgm: null, pvw: null });
   });
